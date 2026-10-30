@@ -4,8 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YroveeLauncher — лаунчер для Minecraft</title>
-<meta name="description" content="Свой лаунчер для Minecraft: Fabric, Forge, моды, шейдеры, сборки, серверы.">
+<meta name="description" content="Свой лаунчер для Minecraft: Fabric, Forge, Quilt, NeoForge, моды, шейдеры, сборки, серверы.">
 <link rel="icon" href="assets/favicon.png">
+<!-- превью ссылки в Discord/Telegram/ВК -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="YroveeLauncher">
+<meta property="og:title" content="YroveeLauncher — лаунчер для Minecraft">
+<meta property="og:description" content="Моды, шейдеры, сборки, серверы и красивый интерфейс. Fabric, Forge, Quilt, NeoForge.">
+<meta property="og:image" content="assets/banner.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0b0d13">
 <style>
   :root{
     --bg:#0b0d13; --card:#131722; --field:#0c0f16; --border:#222839; --text:#eef1f7; --muted:#8a93a6;
@@ -108,6 +116,27 @@
   $("navName").textContent = S.name; $("heroName").textContent = S.name; $("tagline").textContent = S.tagline;
   $("heroVer").textContent = "v" + S.version; $("req").textContent = S.requirements;
   ["navDl","heroDl"].forEach(i => $(i).href = S.downloadUrl); $("src").href = S.sourceUrl;
+
+  // Кнопка «Скачать» сама ведёт на последний релиз с GitHub Releases.
+  // Работает, когда в data.js указана ссылка на репозиторий (даже с ТВОЙ_НИК — нет релиза, останется запасная ссылка).
+  (async () => {
+    try {
+      const m = (S.sourceUrl || S.downloadUrl || "").match(/github\.com\/([^/]+)\/([^/&#]+)/);
+      if (!m) return;
+      const r = await fetch(`https://api.github.com/repos/${m[1]}/${m[2]}/releases/latest`,
+                            {headers: {"Accept": "application/vnd.github+json"}});
+      if (!r.ok) return;
+      const rel = await r.json();
+      const assets = rel.assets || [];
+      const asset = assets.find(a => /setup/i.test(a.name) && a.name.endsWith(".exe"))
+                 || assets.find(a => a.name.endsWith(".exe"))
+                 || assets.find(a => a.name.endsWith(".zip"));
+      if (asset) ["navDl", "heroDl"].forEach(i => $(i).href = asset.browser_download_url);
+      const v = (rel.tag_name || "").replace(/^v/, "");
+      if (v && parseFloat(v) > parseFloat(S.version)) $("heroVer").textContent = "v" + v;
+    } catch (e) { /* нет сети/лимит GitHub — ссылка из data.js остаётся */ }
+  })();
+
   const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
   S.features.forEach(([t, d]) => { const c = el("div", "card"); c.append(el("h3", null, t), el("p", null, d)); $("featGrid").append(c); });
