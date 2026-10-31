@@ -1,0 +1,544 @@
+"""Дополнительные страницы лаунчера: Сборки, Серверы, Скриншоты, Лог, Статистика."""
+import os
+import shutil
+import sys
+import threading
+import uuid
+
+import customtkinter as ctk
+from PIL import Image, ImageOps
+
+import gui as G  # цвета читаем как G.ACCENT в момент вызова: тема может меняться
+import visuals
+from config import INSTANCES_DIR
+from modrinth import search_mods
+from servers import ping_server
+
+
+def fmt_time(seconds):
+    seconds = int(seconds)
+    h, m = seconds // 3600, seconds % 3600 // 60
+    if h:
+        return f"{h} ч {m} мин"
+    return f"{m} мин" if m else f"{seconds} сек"
+
+
+def open_path(path):
+    if sys.platform.startswith("win"):
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        os.system(f'open "{path}"')
+    else:
+        os.system(f'xdg-open "{path}"')
+
+
+class BasePage(ctk.CTkFrame):
+    def __init__(self, app, title, subtitle):
+        super().__init__(app.content, fg_color="transparent")
+        self.app = app
+        self.grid_columnconfigure(0, weight=1)
+        self.subtitle = app._title(self, title, subtitle)
+
+    def on_show(self):
+        pass
+
+    def on_hide(self):
+        pass
+
+    def scroll(self, row):
+        box = ctk.CTkScrollableFrame(self, fg_color="transparent", scrollbar_button_color=G.BORDER,
+                                     scrollbar_button_hover_color=G.MUTED)
+        box.grid(row=row, column=0, sticky="nsew")
+        self.grid_rowconfigure(row, weight=1)
+        return box
+
+    def hint(self, parent, title, sub=""):
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.pack(pady=50)
+        ctk.CTkLabel(box, text=title, font=G.font(16, "bold"), text_color=G.TEXT).pack()
+        if sub:
+            ctk.CTkLabel(box, text=sub, font=G.font(13), text_color=G.MUTED, justify="center").pack(pady=(6, 0))
+
+
+# ======================================================================
+#  Сборки
+# ======================================================================
+class BuildsPage(BasePage):
+    def __init__(self, app):
+        super().__init__(app, "Сборки", "У каждой сборки своя папка: моды, сохранения, ресурспаки")
+        self.grid_rowconfigure(4, weight=1)
+
+        self.tabs = app._segmented(self, ["Мои сборки", "Каталог Modrinth"], lambda _: self.render(), 34)
+        self.tabs.set("Мои сборки")
+        self.tabs.grid(row=2, column=0, sticky="w", pady=(0, 12))
+
+        self.bar = ctk.CTkFrame(self, fg_color="transparent")
+        self.bar.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.bar.grid_columnconfigure(0, weight=1)
+        self.entry = app._entry(self.bar, "")
+        self.entry.grid(row=0, column=0, sticky="ew")
+        self.entry.bind("<Return>", lambda e: self.on_enter())
+        self.action = ctk.CTkButton(self.bar, text="", width=170, height=42, corner_radius=12,
+                                    fg_color=G.ACCENT, hover_color=G.ACCENT_HOVER, text_color=G.ACCENT_TEXT,
+                                    font=G.font(13, "bold"), command=self.on_enter)
+        self.action.grid(row=0, column=1, padx=(10, 0))
+        ctk.CTkButton(self.bar, text="Из файла .mrpack", height=42, corner_radius=12, border_width=1,
+                      fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                      font=G.font(13), command=app.pick_pack_file).grid(row=0, column=2, padx=(10, 0))
+
+        self.list = self.scroll(4)
+        self.status = ctk.CTkLabel(self, text="", font=G.font(13), text_color=G.MUTED, anchor="w",
+                                   justify="left", wraplength=640)
+        self.status.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.hits, self.loading, self.busy = [], False, False
+        self.render()
+
+    def set_status(self, text, error=False):
+        self.status.configure(text=text, text_color=G.ERROR if error else (
+            G.ACCENT if text.startswith("Готово") else G.MUTED))
+
+    def on_show(self):
+        self.render()
+
+    def _clear(self):
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.app.icon_waiters = {}
+
+    def render(self):
+        app = self.app
+        self._clear()
+        catalog = self.tabs.get() == "Каталог Modrinth"
+        self.entry.delete(0, "end")
+        self.entry.configure(placeholder_text="Поиск сборок на Modrinth" if catalog else "Название новой сборки")
+        self.action.configure(text="Найти" if catalog else "Создать из текущей")
+        if catalog:
+            if self.loading:
+                return self.hint(self.list, "Ищу сборки…")
+            if not self.hits:
+                return self.hint(self.list, "Найди сборку", "Введи запрос или нажми «Найти», чтобы увидеть популярные")
+            for hit in self.hits:
+                desc = hit.get("description", "")
+                desc = desc[:127] + "…" if len(desc) > 130 else desc
+                tags = [c.capitalize() for c in hit.get("display_categories", [])
+                        if c not in G.LOADERS][:3]
+                app._mod_row(hit["title"], desc,
+                             f'↓ {G.short_number(hit.get("downloads", 0))}  ·  {hit.get("author", "")}', tags,
+                             "Установить", lambda h=hit: self.install(h),
+                             icon_url=hit.get("icon_url") or "", color=hit.get("color"),
+                             state="disabled" if self.busy else "normal", parent=self.list)
+            return
+        builds = app.cfg["builds"]
+        if not builds:
+            return self.hint(self.list, "Сборок пока нет",
+                             "Создай свою из выбранной версии или поставь готовую из каталога")
+        for b in builds:
+            active = b["id"] == app.cfg["active_build"]
+            app._mod_row(b["name"], f'{b["loader"]} · Minecraft {b["version"]}',
+                         "Выбрана" if active else "", [],
+                         "✓ Выбрана" if active else "Выбрать", lambda bid=b["id"]: self.select(bid),
+                         icon_url=b.get("icon_url", ""), state="disabled" if active else "normal",
+                         parent=self.list,
+                         extra=[("Экспорт .mrpack", lambda bid=b["id"]: app.export_build_dialog(bid)),
+                                ("Убрать", lambda bid=b["id"]: self.remove(bid))])
+
+    def on_enter(self):
+        app = self.app
+        if self.tabs.get() == "Каталог Modrinth":
+            self.loading = True
+            self.render()
+            threading.Thread(target=self._search, args=(self.entry.get().strip(),), daemon=True).start()
+            return
+        name = self.entry.get().strip()
+        if not name:
+            return self.set_status("Введи название сборки", True)
+        if not app.cfg["last_version"]:
+            return self.set_status("Сначала выбери версию на странице «Играть»", True)
+        app.add_build({"id": uuid.uuid4().hex[:8], "name": name, "version": app.cfg["last_version"],
+                       "loader": app.cfg["loader"], "forge_version": "", "icon_url": ""})
+        self.set_status(f"Готово: сборка «{name}» создана и выбрана")
+        self.render()
+
+    def _search(self, query):
+        try:
+            hits = search_mods(query, None, None, kind="modpack")
+            self.app.q.put(("builds_hits", hits))
+        except Exception as e:
+            self.app.q.put(("builds_hits", e))
+
+    def on_hits(self, hits):
+        self.loading = False
+        if isinstance(hits, Exception):
+            self.hits = []
+            self.set_status(f"Ошибка поиска: {hits}", True)
+        else:
+            self.hits = hits
+        self.render()
+
+    def install(self, hit):
+        if self.busy:
+            return
+        self.busy = True
+        self.set_status(f"Установка «{hit['title']}»…")
+        self.render()
+        threading.Thread(target=self.app._modpack_worker, args=(hit["project_id"],), daemon=True).start()
+
+    def finished(self, ok, text):
+        self.busy = False
+        self.set_status(text, not ok)
+        self.render()
+
+    def select(self, bid):
+        self.app.select_build(bid)
+        self.render()
+
+    def remove(self, bid):
+        self.app.remove_build(bid)
+        self.set_status("Сборка убрана из списка (папка с файлами осталась на диске)")
+        self.render()
+
+
+# ======================================================================
+#  Серверы
+# ======================================================================
+class ServersPage(BasePage):
+    REFRESH_MS = 60000  # обновлять онлайн, пока страница открыта
+
+    def __init__(self, app):
+        super().__init__(app, "Серверы", "Список любимых серверов с онлайном и пингом")
+        self.grid_rowconfigure(4, weight=1)
+        self.results = {}  # address -> dict | None (недоступен)
+        self.icons = {}
+        self._job = None
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        bar.grid_columnconfigure(1, weight=1)
+        self.name = app._entry(bar, "Название")
+        self.name.configure(width=170)
+        self.name.grid(row=0, column=0)
+        self.addr = app._entry(bar, "Адрес, например play.example.com:25565")
+        self.addr.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        self.addr.bind("<Return>", lambda e: self.add())
+        ctk.CTkButton(bar, text="+ Добавить", width=110, height=42, corner_radius=12, fg_color=G.ACCENT,
+                      hover_color=G.ACCENT_HOVER, text_color=G.ACCENT_TEXT, font=G.font(13, "bold"),
+                      command=self.add).grid(row=0, column=2, padx=(10, 0))
+        ctk.CTkButton(bar, text="Обновить", width=96, height=42, corner_radius=12, border_width=1,
+                      fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                      font=G.font(13), command=self.refresh).grid(row=0, column=3, padx=(10, 0))
+
+        self.list = self.scroll(4)
+        self.status = ctk.CTkLabel(self, text="", font=G.font(13), text_color=G.MUTED, anchor="w")
+        self.status.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.render()
+
+    def on_show(self):
+        self.refresh()
+        self._schedule()
+
+    def on_hide(self):
+        self._cancel()
+
+    def _schedule(self):
+        self._cancel()
+        self._job = self.after(self.REFRESH_MS, self._tick)
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _tick(self):
+        if self.winfo_ismapped():
+            self.refresh()
+        self._schedule()
+
+    def add(self):
+        name, addr = self.name.get().strip(), self.addr.get().strip()
+        if not addr:
+            self.status.configure(text="Введи адрес сервера", text_color=G.ERROR)
+            return
+        self.app.cfg["servers"].append({"name": name or addr, "address": addr})
+        self.app.save_all()
+        self.name.delete(0, "end")
+        self.addr.delete(0, "end")
+        self.status.configure(text="")
+        self.refresh()
+
+    def remove(self, idx):
+        self.app.cfg["servers"].pop(idx)
+        self.app.save_all()
+        self.render()
+
+    def refresh(self):
+        for s in self.app.cfg["servers"]:
+            self.results.pop(s["address"], None)
+            self.app.icon_pool.submit(self._worker, s["address"])
+        self.render()
+
+    def _worker(self, address):
+        try:
+            res = ping_server(address)
+            if res.get("favicon"):
+                try:
+                    res["icon_pil"] = visuals.process_icon(res["favicon"], G.ICON)
+                except Exception:
+                    pass
+            res.pop("favicon", None)
+        except Exception:
+            res = None
+        self.app.q.put(("server", address, res))
+
+    def on_result(self, address, res):
+        self.results[address] = res
+        if res and res.get("icon_pil") is not None:
+            self.icons[address] = G.ctkimg(res["icon_pil"], (G.ICON, G.ICON))
+        self.render()
+
+    def render(self):
+        app = self.app
+        for w in self.list.winfo_children():
+            w.destroy()
+        servers = app.cfg["servers"]
+        if not servers:
+            return self.hint(self.list, "Серверов пока нет", "Добавь адрес выше — покажу онлайн и пинг")
+        for i, s in enumerate(servers):
+            addr = s["address"]
+            row = ctk.CTkFrame(self.list, fg_color=G.CARD, corner_radius=16, border_width=1,
+                               border_color=G.BORDER)
+            row.pack(fill="x", padx=(0, 8), pady=5)
+            row.grid_columnconfigure(1, weight=1)
+            icon = ctk.CTkLabel(row, text="", width=G.ICON, height=G.ICON)
+            icon.grid(row=0, column=0, rowspan=3, padx=(14, 14), pady=14)
+            icon.configure(image=self.icons.get(addr) or app._placeholder(s["name"], None))
+            ctk.CTkLabel(row, text=s["name"], font=G.font(15, "bold"), text_color=G.TEXT,
+                         anchor="w").grid(row=0, column=1, sticky="sw", pady=(14, 0))
+            res = self.results.get(addr, "wait")
+            if res == "wait":
+                motd, stat, color = addr, "● проверяю…", G.MUTED
+            elif res is None:
+                motd, stat, color = addr, "● недоступен", G.ERROR
+            else:
+                motd = res["motd"].replace("\n", "  ")[:90] or addr
+                stat = f'● {res["online"]}/{res["max"]}  ·  {res["ping_ms"]} мс  ·  {res["version"]}'
+                color = G.ACCENT if res["ping_ms"] < 150 else "#fbbf24"
+            ctk.CTkLabel(row, text=motd, font=G.font(12), text_color=G.MUTED, anchor="w").grid(
+                row=1, column=1, sticky="w")
+            ctk.CTkLabel(row, text=stat, font=G.font(12, "bold"), text_color=color, anchor="w").grid(
+                row=2, column=1, sticky="nw", pady=(2, 14))
+            ctk.CTkButton(row, text="Играть", width=100, height=36, corner_radius=10, fg_color=G.ACCENT,
+                          hover_color=G.ACCENT_HOVER, text_color=G.ACCENT_TEXT, font=G.font(13, "bold"),
+                          command=lambda a=addr: app.play_on_server(a)).grid(
+                row=0, column=2, rowspan=3, padx=(10, 6))
+            ctk.CTkButton(row, text="✕", width=36, height=36, corner_radius=10, border_width=1,
+                          fg_color="transparent", hover_color=G.HOVER, border_color=G.BORDER,
+                          text_color=G.MUTED, font=G.font(13), command=lambda i=i: self.remove(i)).grid(
+                row=0, column=3, rowspan=3, padx=(0, 16))
+
+
+# ======================================================================
+#  Скриншоты
+# ======================================================================
+class ScreenshotsPage(BasePage):
+    COLS, THUMB = 3, (214, 120)
+    LIMIT = 60
+
+    def __init__(self, app):
+        super().__init__(app, "Скриншоты", "Все скриншоты из всех папок игры")
+        self.grid_rowconfigure(3, weight=1)
+        self.thumbs = {}
+        self.cells = {}
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        ctk.CTkButton(bar, text="Обновить", width=96, height=38, corner_radius=12, border_width=1,
+                      fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                      font=G.font(13), command=self.reload).pack(side="left")
+        ctk.CTkButton(bar, text="Открыть папку", width=130, height=38, corner_radius=12, border_width=1,
+                      fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                      font=G.font(13), command=self.open_folder).pack(side="left", padx=(10, 0))
+        self.list = self.scroll(3)
+        for c in range(self.COLS):
+            self.list.grid_columnconfigure(c, weight=1, uniform="shot")
+
+    def on_show(self):
+        self.reload()
+
+    def open_folder(self):
+        folder = self.app._game_dir() / "screenshots"
+        folder.mkdir(parents=True, exist_ok=True)
+        open_path(folder)
+
+    def _scan(self):
+        found = []
+        if INSTANCES_DIR.exists():
+            for d in INSTANCES_DIR.iterdir():
+                shots = d / "screenshots"
+                if shots.is_dir():
+                    for f in shots.glob("*.png"):
+                        found.append((f.stat().st_mtime, f, d.name))
+        found.sort(reverse=True)
+        return found[: self.LIMIT]
+
+    def reload(self):
+        for w in self.list.winfo_children():
+            w.destroy()
+        self.cells = {}
+        shots = self._scan()
+        if not shots:
+            return self.hint(self.list, "Скриншотов пока нет", "Нажми F2 в игре — они появятся здесь")
+        for i, (_, path, inst) in enumerate(shots):
+            cell = ctk.CTkFrame(self.list, fg_color=G.CARD, corner_radius=14, border_width=1,
+                                border_color=G.BORDER, cursor="hand2")
+            cell.grid(row=i // self.COLS, column=i % self.COLS, padx=5, pady=5, sticky="ew")
+            lbl = ctk.CTkLabel(cell, text="", width=self.THUMB[0], height=self.THUMB[1], cursor="hand2")
+            lbl.grid(row=0, column=0, padx=8, pady=(8, 2))
+            cap = ctk.CTkLabel(cell, text=f"{path.stem[:19]}  ·  {inst[:14]}", font=G.font(11),
+                               text_color=G.MUTED, cursor="hand2")
+            cap.grid(row=1, column=0, pady=(0, 8))
+            for w in (cell, lbl, cap):
+                w.bind("<Button-1>", lambda e, p=path: open_path(str(p)))
+            key = str(path)
+            self.cells.setdefault(key, []).append(lbl)
+            if key in self.thumbs:
+                lbl.configure(image=self.thumbs[key])
+            else:
+                self.app.icon_pool.submit(self._thumb_worker, path)
+
+    def _thumb_worker(self, path):
+        try:
+            im = Image.open(path)
+            im.load()
+            w, h = self.THUMB
+            im = visuals.round_corners(ImageOps.fit(im.convert("RGBA"), (w * 2, h * 2), Image.Resampling.LANCZOS), 16)
+            self.app.q.put(("thumb", str(path), im))
+        except Exception:
+            self.app.q.put(("thumb", str(path), None))
+
+    def on_thumb(self, key, pil):
+        if pil is None:
+            return
+        img = G.ctkimg(pil, self.THUMB)
+        self.thumbs[key] = img
+        for lbl in self.cells.get(key, []):
+            try:
+                lbl.configure(image=img)
+            except Exception:
+                pass
+
+
+# ======================================================================
+#  Живой лог игры
+# ======================================================================
+class LogPage(BasePage):
+    MAX_LINES = 4000
+
+    def __init__(self, app):
+        super().__init__(app, "Лог игры", "Здесь появляется всё, что пишет Minecraft во время запуска")
+        self.grid_rowconfigure(4, weight=1)
+        self.count = 0
+
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        for text, cmd in (("Очистить", self.clear), ("Копировать всё", self.copy),
+                          ("Папка crash-reports", self.open_crashes)):
+            ctk.CTkButton(bar, text=text, height=36, corner_radius=12, border_width=1,
+                          fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                          font=G.font(13), command=cmd).pack(side="left", padx=(0, 10))
+
+        self.hint_card = ctk.CTkFrame(self, fg_color=G.CARD, corner_radius=14, border_width=1,
+                                      border_color=G.ERROR)
+        self.hint_label = ctk.CTkLabel(self.hint_card, text="", font=G.font(13), text_color=G.TEXT,
+                                       anchor="w", justify="left", wraplength=640)
+        self.hint_label.pack(fill="x", padx=18, pady=14)
+
+        mono = "Consolas" if sys.platform.startswith("win") else "Courier"
+        self.box = ctk.CTkTextbox(self, fg_color=G.FIELD, border_width=1, border_color=G.BORDER,
+                                  corner_radius=14, text_color="#c7d0e0", font=(mono, 12), wrap="none",
+                                  state="disabled")
+        self.box.grid(row=4, column=0, sticky="nsew")
+        self.append("Лог появится здесь после запуска игры.\n")
+
+    def append(self, line):
+        self.box.configure(state="normal")
+        self.box.insert("end", line if line.endswith("\n") else line + "\n")
+        self.count += max(1, line.count("\n"))
+        if self.count > self.MAX_LINES:
+            self.box.delete("1.0", "1001.0")
+            self.count -= 1000
+        self.box.see("end")
+        self.box.configure(state="disabled")
+
+    def clear(self):
+        self.box.configure(state="normal")
+        self.box.delete("1.0", "end")
+        self.box.configure(state="disabled")
+        self.count = 0
+        self.show_hint("")
+
+    def show_hint(self, text):
+        if text:
+            self.hint_label.configure(text="💡 " + text)
+            self.hint_card.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        else:
+            self.hint_card.grid_remove()
+
+    def copy(self):
+        self.app.clipboard_clear()
+        self.app.clipboard_append(self.box.get("1.0", "end"))
+
+    def open_crashes(self):
+        folder = self.app._game_dir() / "crash-reports"
+        folder.mkdir(parents=True, exist_ok=True)
+        open_path(folder)
+
+
+# ======================================================================
+#  Статистика
+# ======================================================================
+class StatsPage(BasePage):
+    def __init__(self, app):
+        super().__init__(app, "Статистика", "Сколько ты играешь и во что")
+        self.grid_rowconfigure(3, weight=1)
+        tiles = ctk.CTkFrame(self, fg_color="transparent")
+        tiles.grid(row=2, column=0, sticky="ew", pady=(0, 14))
+        tiles.grid_columnconfigure((0, 1, 2), weight=1, uniform="st")
+        self.t_time = app._tile(tiles, "Всего в игре", 0)
+        self.t_runs = app._tile(tiles, "Запусков", 1)
+        self.t_fav = app._tile(tiles, "Любимая версия", 2)
+        self.body = self.scroll(3)
+        self.body.grid_columnconfigure(0, weight=1)
+
+    def on_show(self):
+        for w in self.body.winfo_children():
+            w.destroy()
+        st = self.app.cfg["stats"]
+        by_v, by_a = st.get("by_version", {}), st.get("by_account", {})
+        self.t_time.configure(text=fmt_time(sum(by_v.values())))
+        self.t_runs.configure(text=str(st.get("launches", 0)))
+        self.t_fav.configure(text=max(by_v, key=by_v.get) if by_v else "—")
+        if not by_v:
+            return self.hint(self.body, "Пока пусто", "Сыграй пару минут — и тут появятся цифры")
+        self._section("По версиям", by_v, 0)
+        self._section("По аккаунтам", by_a, 1)
+
+    def _section(self, title, data, row):
+        card = self.app._card(self.body)
+        card.grid(row=row, column=0, sticky="ew", padx=(0, 8), pady=(0, 14))
+        card.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(card, text=title, font=G.font(13, "bold"), text_color=G.MUTED, anchor="w").grid(
+            row=0, column=0, columnspan=3, sticky="w", padx=22, pady=(18, 8))
+        items = sorted(data.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        top = max((v for _, v in items), default=1) or 1
+        for i, (name, secs) in enumerate(items, start=1):
+            ctk.CTkLabel(card, text=name, font=G.font(13), text_color=G.TEXT, anchor="w", width=150).grid(
+                row=i, column=0, sticky="w", padx=(22, 10), pady=4)
+            bar = ctk.CTkProgressBar(card, height=10, corner_radius=5, fg_color=G.BORDER,
+                                     progress_color=G.ACCENT)
+            bar.set(secs / top)
+            bar.grid(row=i, column=1, sticky="ew", pady=4)
+            ctk.CTkLabel(card, text=fmt_time(secs), font=G.font(12), text_color=G.MUTED, anchor="e",
+                         width=90).grid(row=i, column=2, padx=(10, 22), pady=4)
+        ctk.CTkFrame(card, height=10, fg_color="transparent").grid(row=len(items) + 1, column=0)

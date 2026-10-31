@@ -1,0 +1,20 @@
+КАК СОБРАТЬ .EXE
+================
+
+Запусти build_exe.bat (двойной клик). Дальше всё само:
+  1. окружение сборки .venv-build (создаётся один раз),
+  2. зависимости из requirements.txt + PyInstaller,
+  3. сборка exe (2-5 минут),
+  4. dist_out\YroveeLauncher-win64.zip,
+  5. если стоит Inno Setup — установщик dist_out\YroveeLauncher-Setup.exe
+     (именно его ищут сайт и автообновление лаунчера).
+
+Вся логика сборки — в build.py (bat — только запускатель).
+Версия берётся из config.py: LAUNCHER_VERSION.
+
+Нужно один раз поставить:
+  - Python 3.10+ (python.org, галка Add to PATH)
+  - Inno Setup 6 (jrsoftware.org/isdl.php) — только для Setup.exe
+
+Готовые файлы — в dist_out. Как выложить на GitHub, чтобы качалось
+с сайта: инструкция GITHUB.md.
