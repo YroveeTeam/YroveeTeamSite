@@ -7,8 +7,8 @@ window.SITE = {
   version: "0.9",
   tagline: "Свой лаунчер для Minecraft: моды, шейдеры, сборки, серверы и красивый интерфейс.",
   // ссылка на скачивание: например страница релизов на GitHub
-  downloadUrl: "https://github.com/YroveeTeam/YroveeLauncher/releases/latest",
-  sourceUrl: "https://github.com/YroveeTeam/YroveeLauncher",
+  downloadUrl: "https://github.com/YroveeTeam/YroveeTeamSite/releases/latest",
+  sourceUrl: "https://github.com/YroveeTeam/YroveeTeamSite",
   requirements: "Windows 10/11 · ничего устанавливать не нужно — Java и игра скачиваются сами",
 
   features: [

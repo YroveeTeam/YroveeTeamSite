@@ -8,8 +8,8 @@ if getattr(sys, "frozen", False):  # запущен как .exe: данные л
     ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "YroveeLauncher"
 else:
     ROOT = Path(__file__).resolve().parent
-SITE_URL = "https://yroveeteam.github.io/YroveeLauncher/"  # адрес сайта на GitHub Pages
-REPO = "YroveeTeam/YroveeLauncher"  # owner/repo на GitHub: для релизов и самообновления
+SITE_URL = "https://yroveeteam.github.io/YroveeTeamSite/"  # адрес сайта на GitHub Pages
+REPO = "YroveeTeam/YroveeTeamSite"  # owner/repo на GitHub: для релизов и самообновления
 DATA = ROOT / "data"
 VERSIONS_DIR = DATA / "versions"
 LIBRARIES_DIR = DATA / "libraries"

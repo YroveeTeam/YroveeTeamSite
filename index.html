@@ -128,8 +128,9 @@
       if (!r.ok) return;
       const rel = await r.json();
       const assets = rel.assets || [];
+      // Setup.exe (установщик) или zip (портативная). Голый YroveeLauncher.exe из
+      // папки сборки не подходит — он не работает без соседней папки _internal.
       const asset = assets.find(a => /setup/i.test(a.name) && a.name.endsWith(".exe"))
-                 || assets.find(a => a.name.endsWith(".exe"))
                  || assets.find(a => a.name.endsWith(".zip"));
       if (asset) ["navDl", "heroDl"].forEach(i => $(i).href = asset.browser_download_url);
       const v = (rel.tag_name || "").replace(/^v/, "");
