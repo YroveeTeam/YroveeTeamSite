@@ -19,25 +19,28 @@ from tkinter import filedialog
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+import net
 import visuals
 import auth
 import cosmetics as cos
+import strings
 import rpc
+import skin3d
 import updater
 from shop_pages import CharacterPage, ShopPage, show_drop_dialog
 from auth import ensure_msa_token
 from builds import install_modpack, install_pack_zip
-from config import (BACKUPS_DIR, MSA_CLIENT_ID, NATIVES_DIR, REPO, SITE_URL, CACHE_DIR,
+from config import (BACKUPS_DIR, LOGS_DIR, MSA_CLIENT_ID, NATIVES_DIR, REPO, RUNTIME_DIR, SITE_URL, CACHE_DIR,
                     INSTANCES_DIR, LAUNCHER_NAME, LAUNCHER_VERSION, SKINS_DIR,
                     instance_dir, load_config, save_config)
 from export_pack import detect_loader_version, export_modpack
 from fabric import fabric_id, install_fabric
 from forge import ensure_forge, find_forge_id
 from gamelog import LogWriter, crash_hint
-from maintenance import backup_saves, import_from_official, restore_backup
+from maintenance import backup_saves, import_from_dir, import_from_official, restore_backup
 from neoforge import ensure_neoforge, find_neoforge_id
 from pages_extra import (BuildsPage, LogPage, ScreenshotsPage, ServersPage,
-                         StatsPage, WorldsPage)
+                         StatsPage, WorldsPage, fmt_time)
 from quilt import install_quilt, quilt_id
 from java_installer import ensure_java
 from launcher import launch, required_java
@@ -90,16 +93,37 @@ def rgbhex(c):
     return "#%02x%02x%02x" % tuple(int(x) for x in c)
 
 
-def apply_theme(name):
-    """Подменяет акцентные цвета ДО построения окна (смена темы = перезапуск)."""
-    global ACCENT, ACCENT2, ACCENT_HOVER, SEG_ON, SEG_ON_HOVER, ACTIVE
-    a, b = THEMES.get(name, THEMES["Мята"])
-    ra, rbg = visuals.hex_rgb(a), visuals.hex_rgb(BG)
+def apply_theme(name=None, mode=None):
+    """Полная палитра: тёмная (по умолчанию) или светлая + акцентные цвета.
+    Вызывается ДО построения окна (смена темы = перезапуск)."""
+    cfg = load_config()
+    mode = mode or cfg.get("theme_mode", "dark")
+    a, b = THEMES.get(cfg.get("theme", "Мята"), THEMES["Мята"])
+    if cfg.get("theme") == "Свой цвет":
+        import colorsys
+        a = cfg.get("custom_color", "#7c5cff")
+        r1, g1, b1 = visuals.hex_rgb(a)
+        h, s, v = colorsys.rgb_to_hsv(r1 / 255, g1 / 255, b1 / 255)
+        r2, g2, b2 = colorsys.hsv_to_rgb((h + 0.12) % 1, min(1, s), v)
+        b = "#%02x%02x%02x" % (int(r2 * 255), int(g2 * 255), int(b2 * 255))
+    global BG, SIDEBAR, CARD, FIELD, BORDER, HOVER, ACTIVE, TEXT, MUTED, ERROR
+    global ACCENT, ACCENT2, ACCENT_HOVER, SEG_ON, SEG_ON_HOVER, ACCENT_TEXT
+    if mode == "light":
+        BG, SIDEBAR, CARD = "#f6f5f3", "#edebe9", "#ffffff"
+        FIELD, BORDER, HOVER = "#f1f0ee", "#e3e1de", "#e9e7e4"
+        TEXT, MUTED, ERROR = "#1c1917", "#78716c", "#dc2626"
+    else:
+        BG, SIDEBAR, CARD = "#0b0d13", "#0e1118", "#131722"
+        FIELD, BORDER, HOVER = "#0c0f16", "#222839", "#1b2233"
+        TEXT, MUTED, ERROR = "#eef1f7", "#8a93a6", "#f87171"
     ACCENT, ACCENT2 = a, b
-    ACCENT_HOVER = rgbhex(visuals.mix(ra, (0, 0, 0), 0.12))
+    ra, rbg = visuals.hex_rgb(a), visuals.hex_rgb(BG)
+    dark_mix = (0, 0, 0) if mode == "dark" else (255, 255, 255)
+    ACCENT_HOVER = rgbhex(visuals.mix(ra, dark_mix, 0.12))
     SEG_ON = rgbhex(visuals.mix(ra, rbg, 0.72))
     SEG_ON_HOVER = rgbhex(visuals.mix(ra, rbg, 0.62))
     ACTIVE = rgbhex(visuals.mix(ra, rbg, 0.9))
+    ACCENT_TEXT = "#06121a"
 
 
 def font(size, weight="normal"):
@@ -673,24 +697,33 @@ class App(ctk.CTk):
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
 
-        self.pages = {
-            "play": self._build_play(),
-            "shop": ShopPage(self),
-            "char": CharacterPage(self),
-            "mods": self._build_mods(),
-            "builds": BuildsPage(self),
-            "servers": ServersPage(self),
-            "worlds": WorldsPage(self),
-            "shots": ScreenshotsPage(self),
-            "log": LogPage(self),
-            "stats": StatsPage(self),
-            "settings": self._build_settings(),
-        }
+        self.pages = {"play": self._build_play(), "mods": self._build_mods(),
+                      "builds": BuildsPage(self), "servers": ServersPage(self),
+                      "worlds": WorldsPage(self), "shots": ScreenshotsPage(self),
+                      "log": LogPage(self), "stats": StatsPage(self),
+                      "settings": self._build_settings()}
+        if self._cos_on():
+            self.pages["shop"] = ShopPage(self)
+            self.pages["char"] = CharacterPage(self)
+            # порядок страниц в dict не важен, но shop/char должны существовать для навигации
         for page in self.pages.values():
             page.grid(row=0, column=0, sticky="nsew")
         self.show_page("play")
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.active_games = 0
+        self._konami_seq = []
+        self.bind_all("<Control-Return>", lambda e: self.on_play())
+        for i, key in enumerate(list(self.nav.keys())[:9], start=1):
+            self.bind_all(f"<Control-Key-{i}>", lambda e, k=key: self.show_page(k))
+        self.bind_all("<Control-f>", lambda e: self._hotkey_search())
+        self.bind_all("<Control-F>", lambda e: self._hotkey_search())
+        self.bind_all("<Key>", self._konami_key)
+        if self.cfg.get("window_geometry"):
+            try:
+                self.geometry(self.cfg["window_geometry"])
+            except Exception:
+                pass
         self.after(50, self._poll)
         self.after(400, self._set_window_icon)
         threading.Thread(target=self._load_versions, daemon=True).start()
@@ -701,6 +734,59 @@ class App(ctk.CTk):
         packs = [a for a in sys.argv[1:] if a.lower().endswith(".mrpack")]
         if packs:
             self.after(900, lambda: self.install_pack_files(packs))
+
+    def _hotkey_search(self):
+        self.show_page("mods")
+        if hasattr(self, "mod_query"):
+            self.mod_query.focus_set()
+
+    KONAMI = ("Up", "Up", "Down", "Down", "Left", "Right", "Left", "Right", "b", "a")
+
+    def _konami_key(self, e):
+        if e.keysym not in self.KONAMI:
+            self._konami_seq.clear()
+            return
+        self._konami_seq.append(e.keysym)
+        del self._konami_seq[:-10]
+        if tuple(self._konami_seq) == self.KONAMI and not self.cfg.get("konami"):
+            self.cfg["konami"] = True
+            cos.add_crystals(self.cfg, 100)
+            save_config(self.cfg)
+            self._set_status("🎮 Konami code! Секретные +100 💎 за смекалку", ACCENT)
+
+    def _toggle_mini(self):
+        if not getattr(self, "_mini_frame", None):
+            mf = ctk.CTkFrame(self, fg_color=BG)
+            mf.grid(row=0, column=0, sticky="nsew")
+            mf.grid_columnconfigure(0, weight=1)
+            lbl = ctk.CTkLabel(mf, text="")
+            lbl.grid(row=0, column=0, pady=(10, 4))
+            ctk.CTkButton(mf, text="▶ Играть", height=46, corner_radius=14,
+                          fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
+                          font=font(16, "bold"), command=self.on_play).grid(
+                row=1, column=0, sticky="ew", padx=16)
+            ctk.CTkButton(mf, text="◱ Развернуть", height=32, corner_radius=10, border_width=1,
+                          fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
+                          text_color=MUTED, font=font(12), command=self._toggle_mini).grid(
+                row=2, column=0, sticky="ew", padx=16, pady=(8, 14))
+            self._mini_frame, self._mini_lbl = mf, lbl
+        self._mini = not getattr(self, "_mini", False)
+        if self._mini:
+            self._mini_frame.grid(row=0, column=0, sticky="nsew")
+            self.sidebar.grid_remove()
+            self.content.grid_remove()
+            self.geometry("360x230")
+            if self._cos_on():
+                ch = self._lobby_character()
+                if ch is not None:
+                    ch = ch.resize((int(ch.width * 110 / ch.height), 110))
+                    self._mini_img = ctkimg(ch, ch.size)
+                    self._mini_lbl.configure(image=self._mini_img, text="")
+        else:
+            self._mini_frame.grid_remove()
+            self.sidebar.grid()
+            self.content.grid()
+            self.geometry(self.cfg.get("window_geometry") or "1000x700")
 
     def _set_window_icon(self):
         try:
@@ -736,7 +822,8 @@ class App(ctk.CTk):
     def _title(self, page, title, subtitle):
         ctk.CTkLabel(page, text=title, font=font(30, "bold"), text_color=TEXT).grid(
             row=0, column=0, sticky="w")
-        sub = ctk.CTkLabel(page, text=subtitle, font=font(14), text_color=MUTED)
+        sub = ctk.CTkLabel(page, text=subtitle, font=font(14), text_color=MUTED,
+                           wraplength=820, justify="left")
         sub.grid(row=1, column=0, sticky="w", pady=(2, 20))
         return sub
 
@@ -763,6 +850,7 @@ class App(ctk.CTk):
     # ---------- боковая панель ----------
     def _build_sidebar(self):
         bar = ctk.CTkFrame(self, width=232, fg_color=SIDEBAR, corner_radius=0)
+        self.sidebar = bar
         bar.grid(row=0, column=0, sticky="ns")
         bar.grid_propagate(False)
         bar.grid_columnconfigure(0, weight=1)
@@ -777,13 +865,21 @@ class App(ctk.CTk):
                      text_color=TEXT, anchor="w").grid(row=0, column=0, sticky="sw", padx=(56, 0))
         ctk.CTkLabel(brand, text="Minecraft launcher", font=font(11),
                      text_color=MUTED, anchor="w").grid(row=1, column=0, sticky="nw", padx=(56, 0))
+        ctk.CTkButton(brand, text="◱", width=30, height=30, corner_radius=8, border_width=1,
+                      fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
+                      text_color=MUTED, font=font(13), command=self._toggle_mini).grid(
+            row=0, column=1, rowspan=2, sticky="e")
 
         self.nav = {}
         self.nav_icons = {}
-        items = [("play", "Играть"), ("shop", "Магазин"), ("char", "Персонаж"),
-                 ("mods", "Моды и паки"), ("builds", "Сборки"),
-                 ("servers", "Серверы"), ("worlds", "Миры"), ("shots", "Скриншоты"),
-                 ("log", "Лог игры"), ("stats", "Статистика"), ("settings", "Настройки")]
+        cos_on = self.cfg.get("cosmetics_enabled", True)
+        items = [("play", strings.T("Играть"))]
+        if cos_on:
+            items += [("shop", strings.T("Магазин")), ("char", strings.T("Персонаж"))]
+        items += [("mods", strings.T("Моды и паки")), ("builds", strings.T("Сборки")),
+                  ("servers", strings.T("Серверы")), ("worlds", strings.T("Миры")),
+                  ("shots", strings.T("Скриншоты")), ("log", strings.T("Лог игры")),
+                  ("stats", strings.T("Статистика")), ("settings", strings.T("Настройки"))]
         for i, (key, text) in enumerate(items, start=1):
             off = ctkimg(visuals.nav_icon(key, MUTED), (20, 20))
             on = ctkimg(visuals.nav_icon(key, ACCENT), (20, 20))
@@ -801,10 +897,13 @@ class App(ctk.CTk):
             btn.grid(row=0, column=1, sticky="ew")
             self.nav[key] = (btn, ind)
 
+        spacer_row = len(items) + 1
+        bar.grid_rowconfigure(spacer_row, weight=1)
+
         # карточка аккаунта внизу: клик открывает быструю смену и настройки
         prof = ctk.CTkFrame(bar, fg_color=CARD, corner_radius=16, border_width=1,
                             border_color=BORDER, cursor="hand2")
-        prof.grid(row=11, column=0, sticky="ew", padx=14, pady=(0, 18))
+        prof.grid(row=spacer_row + 1, column=0, sticky="ew", padx=14, pady=(0, 18))
         prof.grid_columnconfigure(1, weight=1)
         self.avatar_lbl = ctk.CTkLabel(prof, text="", width=40, height=40, cursor="hand2")
         self.avatar_lbl.grid(row=0, column=0, rowspan=2, padx=(12, 10), pady=12)
@@ -967,38 +1066,50 @@ class App(ctk.CTk):
             page.on_show()
 
     # ================== страница «Играть» (лобби) ==================
+    def _cos_on(self):
+        return bool(self.cfg.get("cosmetics_enabled", True))
+
     def _build_play(self):
         page = ctk.CTkFrame(self.content, fg_color="transparent")
         page.grid_columnconfigure(0, weight=1)
         page.grid_rowconfigure(4, weight=1)
 
-        self.banner_lbl = ctk.CTkLabel(page, text="", height=LOBBY_H)
+        self.banner_lbl = ctk.CTkLabel(page, text="", height=LOBBY_H, anchor="center")
         self.banner_lbl.grid(row=0, column=0, sticky="ew")
         self._set_banner(700)
         page.bind("<Configure>", self._on_play_page_configure)
 
-        # быстрые переходы в стиле современных лаунчеров
-        quick = ctk.CTkFrame(page, fg_color="transparent")
-        quick.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        quick.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="quick")
-        for col, (key, label, color, hover) in enumerate((
-                ("shop", "🎁  Магазин", "#7c3aed", "#8b5cf6"),
-                ("char", "👤  Персонаж", "#0284c7", "#0ea5e9"),
-                ("builds", "🧱  Сборки", "#b45309", "#f59e0b"),
-                ("servers", "🌐  Серверы", "#059669", "#10b981"))):
-            ctk.CTkButton(quick, text=label, height=56, corner_radius=14,
-                          fg_color=color, hover_color=hover, text_color="#ffffff",
-                          font=font(15, "bold"), command=lambda k=key: self.show_page(k)
-                          ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 10, 0))
+        if self._cos_on():
+            # быстрые переходы в стиле современных лаунчеров
+            quick = ctk.CTkFrame(page, fg_color="transparent")
+            quick.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+            quick.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="quick")
+            for col, (key, label, color, hover) in enumerate((
+                    ("shop", strings.T("🎁  Магазин"), "#7c3aed", "#8b5cf6"),
+                    ("char", strings.T("👤  Персонаж"), "#0284c7", "#0ea5e9"),
+                    ("builds", strings.T("🧱  Сборки"), "#b45309", "#f59e0b"),
+                    ("servers", strings.T("🌐  Серверы"), "#059669", "#10b981"))):
+                ctk.CTkButton(quick, text=label, height=56, corner_radius=14,
+                              fg_color=color, hover_color=hover, text_color="#ffffff",
+                              font=font(15, "bold"), command=lambda k=key: self.show_page(k)
+                              ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 10, 0))
+            news_row = 2
+        else:
+            news_row = 1
+
+        # новости с сайта (заполняется после проверки обновлений)
+        self.news_frame = ctk.CTkFrame(page, fg_color="transparent")
+        self.news_frame.grid(row=news_row, column=0, sticky="ew", pady=(12, 0))
+        self.news_frame.grid_columnconfigure(0, weight=1)
 
         card = self._card(page)
-        card.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        card.grid(row=news_row + 1, column=0, sticky="ew", pady=(12, 0))
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="x", padx=22, pady=16)
         inner.grid_columnconfigure(0, weight=1)
         inner.grid_columnconfigure(1, weight=1)
 
-        self._caption(inner, "Аккаунт").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._caption(inner, strings.T("Аккаунт")).grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.acc_btn = ctk.CTkButton(
             inner, text=f"{self.account()['name']}   ▾", anchor="w", height=42, corner_radius=12,
             border_width=1, fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
@@ -1006,7 +1117,7 @@ class App(ctk.CTk):
         )
         self.acc_btn.grid(row=1, column=0, sticky="ew")
 
-        self._caption(inner, "Версия").grid(row=0, column=1, sticky="w", padx=(14, 0), pady=(0, 6))
+        self._caption(inner, strings.T("Версия")).grid(row=0, column=1, sticky="w", padx=(14, 0), pady=(0, 6))
         self.version_btn = ctk.CTkButton(
             inner, text=self._version_text(), anchor="w", height=42, corner_radius=12,
             border_width=1, fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
@@ -1014,22 +1125,25 @@ class App(ctk.CTk):
         )
         self.version_btn.grid(row=1, column=1, sticky="ew", padx=(14, 0))
 
-        self._caption(inner, "Загрузчик").grid(row=0, column=2, sticky="w", padx=(14, 0), pady=(0, 6))
+        self._caption(inner, strings.T("Загрузчик")).grid(row=0, column=2, sticky="w", padx=(14, 0), pady=(0, 6))
         self.loader = self._segmented(
             inner, ["Vanilla", "Fabric", "Forge", "Quilt", "NeoForge"], self._set_loader, height=42)
         self.loader.set(self.cfg["loader"])
         self.loader.grid(row=1, column=2, sticky="e", padx=(14, 0))
 
         tiles = ctk.CTkFrame(page, fg_color="transparent")
-        tiles.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        tiles.grid(row=news_row + 2, column=0, sticky="ew", pady=(12, 0))
         tiles.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="tile")
-        self.tile_ram = self._tile(tiles, "Память", 0)
-        self.tile_loader = self._tile(tiles, "Загрузчик", 1)
-        self.tile_mods = self._tile(tiles, "Модов", 2)
-        self.tile_crystals = self._tile_btn(tiles, "Кристаллы", 3, lambda: self.show_page("shop"))
+        self.tile_ram = self._tile(tiles, strings.T("Память"), 0)
+        self.tile_loader = self._tile(tiles, strings.T("Загрузчик"), 1)
+        self.tile_mods = self._tile(tiles, strings.T("Модов"), 2)
+        if self._cos_on():
+            self.tile_crystals = self._tile_btn(tiles, strings.T("Кристаллы"), 3, lambda: self.show_page("shop"))
+        else:
+            self.tile_build = self._tile(tiles, strings.T("Сборка"), 3)
 
         bottom = ctk.CTkFrame(page, fg_color="transparent")
-        bottom.grid(row=5, column=0, sticky="ew", pady=(14, 0))
+        bottom.grid(row=news_row + 4, column=0, sticky="ew", pady=(14, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
         self.status = ctk.CTkLabel(bottom, text="", font=font(13), text_color=MUTED,
@@ -1043,19 +1157,20 @@ class App(ctk.CTk):
 
         # кнопка «Играть»: обычная скруглённая кнопка (раньше была картинка — на некоторых ПК не рисовалась)
         self.play_btn = ctk.CTkButton(
-            bottom, text="Играть", height=PLAY_H, corner_radius=16, fg_color=ACCENT,
+            bottom, text=strings.T("Играть"), height=PLAY_H, corner_radius=16, fg_color=ACCENT,
             hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT, text_color_disabled=TEXT,
             font=font(19, "bold"), command=self.on_play,
         )
         self.play_btn.grid(row=2, column=0, sticky="ew")
 
-        self.chest_btn = ctk.CTkButton(
-            bottom, text="🎁 Сундук за игру", height=PLAY_H, corner_radius=16,
-            fg_color=FIELD, hover_color=FIELD, text_color=MUTED, text_color_disabled=MUTED,
-            font=font(15, "bold"), command=self.claim_chest, state="disabled",
-        )
-        self.chest_btn.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self._refresh_chest_btn()
+        if self._cos_on():
+            self.chest_btn = ctk.CTkButton(
+                bottom, text="🎁 Сундук за игру", height=PLAY_H, corner_radius=16,
+                fg_color=FIELD, hover_color=FIELD, text_color=MUTED, text_color_disabled=MUTED,
+                font=font(15, "bold"), command=self.claim_chest, state="disabled",
+            )
+            self.chest_btn.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+            self._refresh_chest_btn()
         return page
 
     def _tile_btn(self, parent, caption, col, command):
@@ -1099,16 +1214,98 @@ class App(ctk.CTk):
         self._refresh_chest_btn()
         self._refresh_tiles()
         if hasattr(self, "side_sub"):
-            self.side_sub.configure(text=f"💎 {cos.balance(self.cfg)}  ·  v{LAUNCHER_VERSION}")
+            sub = f"💎 {cos.balance(self.cfg)}  ·  v{LAUNCHER_VERSION}" if self._cos_on() \
+                else f"v{LAUNCHER_VERSION}"
+            self.side_sub.configure(text=sub)
 
     def _lobby_character(self):
         try:
             acc = self.account()
             path = SKINS_DIR / acc["skin"] if acc.get("skin") else None
             skin = path.read_bytes() if path and path.exists() else None
-            return cos.render_character(skin, cos.equipped(self.cfg), view="front", scale=6)
+            return skin3d.render_3d(skin, cos.equipped(self.cfg),
+                                    yaw=-0.32, pitch=-0.08, height=380)
         except Exception:
             return None
+
+    def _lobby_reminder(self):
+        if not self._cos_on():
+            return ""
+        st = cos.advent_state(self.cfg)
+        if st and st[1]:
+            return "🎄 Адвент-календарь: сегодняшняя дверца ждёт!"
+        day, claimed = cos.season_state(self.cfg)
+        if day >= cos.SEASON_DAYS - 2 and day not in claimed:
+            return f"⭐ Сезон заканчивается — забери награду дня {day}!"
+        return ""
+
+    def _show_news(self, news):
+        """Лента новостей с сайта — карточка в лобби."""
+        if not hasattr(self, "news_frame"):
+            return
+        for w in self.news_frame.winfo_children():
+            w.destroy()
+        reminder = self._lobby_reminder()
+        if not news and not reminder:
+            self.news_frame.grid_remove()
+            return
+        self.news_frame.grid()
+        if reminder:
+            card = self._card(self.news_frame)
+            card.grid(row=0, column=0, sticky="ew")
+            card.configure(border_color=ACCENT)
+            ctk.CTkLabel(card, text=reminder, font=font(13, "bold"), text_color=ACCENT,
+                         anchor="w", justify="left", wraplength=760).grid(
+                row=0, column=0, sticky="w", padx=18, pady=12)
+            row_news = 1
+        else:
+            row_news = 0
+        if not news:
+            return
+        self.news_frame.grid()
+        card = self._card(self.news_frame)
+        card.grid(row=row_news, column=0, sticky="ew", pady=(6, 0) if reminder else (0, 0))
+        card.grid_columnconfigure(0, weight=1)
+        first = news[0]
+        text = first.get("text", "") if isinstance(first, dict) else str(first)
+        date = first.get("date", "") if isinstance(first, dict) else ""
+        ctk.CTkLabel(card, text=f"📰  {text}", font=font(13), text_color=TEXT, anchor="w",
+                     justify="left", wraplength=760).grid(row=0, column=0, sticky="w",
+                                                          padx=18, pady=(12, 2))
+        ctk.CTkLabel(card, text=date, font=font(11), text_color=MUTED, anchor="w").grid(
+            row=1, column=0, sticky="w", padx=18, pady=(0, 12))
+        if len(news) > 1:
+            ctk.CTkButton(card, text=f"Все новости ({len(news)})", height=30, corner_radius=9,
+                          border_width=1, fg_color="transparent", hover_color=HOVER,
+                          border_color=BORDER, text_color=MUTED, font=font(12),
+                          command=lambda: self._all_news_dialog(news)).grid(
+                row=0, column=1, rowspan=2, padx=14)
+
+    def _all_news_dialog(self, news):
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Новости")
+        dlg.geometry("560x480")
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.after(250, lambda: (dlg.lift(), dlg.focus_force(), dlg.grab_set()))
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(dlg, text="📰 Новости", font=font(20, "bold"), text_color=TEXT).grid(
+            row=0, column=0, sticky="w", padx=20, pady=(16, 6))
+        box = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                     scrollbar_button_color=BORDER,
+                                     scrollbar_button_hover_color=MUTED)
+        box.grid(row=1, column=0, sticky="nsew", padx=12)
+        box.grid_columnconfigure(0, weight=1)
+        for n in news:
+            card = self._card(box)
+            card.pack(fill="x", padx=4, pady=4)
+            ctk.CTkLabel(card, text=n.get("text", "") if isinstance(n, dict) else str(n),
+                         font=font(13), text_color=TEXT, anchor="w", justify="left",
+                         wraplength=470).pack(anchor="w", padx=16, pady=(10, 2))
+            ctk.CTkLabel(card, text=n.get("date", "") if isinstance(n, dict) else "",
+                         font=font(11), text_color=MUTED, anchor="w").pack(
+                anchor="w", padx=16, pady=(0, 10))
 
     def _tile(self, parent, caption, col):
         f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
@@ -1126,15 +1323,28 @@ class App(ctk.CTk):
         if self.cfg["loader"] != "Vanilla" and self.cfg["last_version"]:
             count = str(len(list_installed(self._game_dir() / "mods")))
         self.tile_mods.configure(text=count)
-        self.tile_crystals.configure(text=f"{cos.balance(self.cfg)} 💎")
+        if self._cos_on():
+            self.tile_crystals.configure(text=f"{cos.balance(self.cfg)} 💎")
+        else:
+            b = self._build()
+            self.tile_build.configure(text=(b["name"][:14] + "…" if len(b["name"]) > 15 else b["name"]) if b else "—")
 
     # --- фон лобби: лучи, блёстки и твой персонаж с косметикой ---
     def _set_banner(self, w):
         self.banner_w = w
-        pil = visuals.lobby_backdrop(w, LOBBY_H, character=self._lobby_character(),
-                                     accent=ACCENT)
+        if self._cos_on():
+            pil = visuals.lobby_backdrop(w, LOBBY_H, character=self._lobby_character(),
+                                         accent=ACCENT, light=self._is_light())
+        else:  # классический баннер, когда косметика выключена
+            v = self.cfg["last_version"]
+            sub = f"Minecraft {v} · {self.cfg['loader']}" if v else "Выбери версию и нажми «Играть»"
+            pil = visuals.banner(w, LOBBY_H, "Minecraft launcher", LAUNCHER_NAME, sub,
+                                 palette=visuals.palette_for(v), accent=ACCENT)
         self._banner_img = ctkimg(pil, (w, LOBBY_H))
         self.banner_lbl.configure(image=self._banner_img)
+
+    def _is_light(self):
+        return self.cfg.get("theme_mode", "dark") == "light"
 
     def _refresh_banner(self):
         if hasattr(self, "banner_lbl"):
@@ -1249,15 +1459,20 @@ class App(ctk.CTk):
             font=font(14, "bold"), command=self.mods_search,
         ).grid(row=0, column=1, padx=(10, 0))
         ctk.CTkButton(
+            bar, text="🪄 Собрать за меня", width=150, height=42, corner_radius=12,
+            fg_color="#7c3aed", hover_color="#8b5cf6", text_color="#ffffff",
+            font=font(13, "bold"), command=self.build_wizard,
+        ).grid(row=0, column=2, padx=(10, 0))
+        ctk.CTkButton(
             bar, text="Из файла", width=110, height=42, corner_radius=12, border_width=1,
             fg_color=FIELD, hover_color=HOVER, border_color=BORDER, text_color=TEXT,
             font=font(13), command=self.mod_from_file,
-        ).grid(row=0, column=2, padx=(10, 0))
+        ).grid(row=0, column=3, padx=(10, 0))
         ctk.CTkButton(
             bar, text="Папка", width=84, height=42, corner_radius=12, border_width=1,
             fg_color=FIELD, hover_color=HOVER, border_color=BORDER, text_color=TEXT,
             font=font(13), command=self.open_mods_folder,
-        ).grid(row=0, column=3, padx=(10, 0))
+        ).grid(row=0, column=4, padx=(10, 0))
 
         tabsbar = ctk.CTkFrame(page, fg_color="transparent")
         tabsbar.grid(row=3, column=0, sticky="ew", pady=(14, 4))
@@ -1710,6 +1925,71 @@ class App(ctk.CTk):
         self._set_mod_status(f"В очереди: {hit['title']}")
         self._render_mods()
 
+    BUILD_WIZARD_STYLE = {
+        "Выживание": ["appleskin", "jei"],
+        "Техно": ["create", "jei"],
+        "Магия": ["botania", "jei"],
+    }
+
+    def build_wizard(self):
+        """🪄 Мастер: слабый ПК + стиль -> версия, загрузчик и набор модов."""
+        if self._kind_ready():
+            self._set_mod_status(ready_msg[0] if (ready_msg := self._kind_ready()) else "", True)
+            return
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Собрать сборку за меня")
+        dlg.geometry("460x340")
+        dlg.resizable(False, False)
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.after(250, lambda: (dlg.lift(), dlg.focus_force(), dlg.grab_set()))
+        dlg.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(dlg, text="🪄 Собери сборку за меня", font=font(19, "bold"),
+                     text_color=TEXT).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(dlg, text="Ответь на два вопроса — остальное подберёт лаунчер",
+                     font=font(12), text_color=MUTED, anchor="w").grid(
+            row=1, column=0, sticky="w", padx=20)
+        ctk.CTkLabel(dlg, text="Компьютер:", font=font(13), text_color=TEXT,
+                     anchor="w").grid(row=2, column=0, sticky="w", padx=20, pady=(10, 0))
+        pc = ctk.CTkOptionMenu(dlg, values=["Мощный", "Средний", "Слабый"], height=38,
+                               fg_color=FIELD, button_color=BORDER, button_hover_color=HOVER,
+                               text_color=TEXT, font=font(13))
+        pc.set("Средний")
+        pc.grid(row=3, column=0, sticky="ew", padx=20)
+        ctk.CTkLabel(dlg, text="Стиль игры:", font=font(13), text_color=TEXT,
+                     anchor="w").grid(row=4, column=0, sticky="w", padx=20, pady=(8, 0))
+        style = ctk.CTkOptionMenu(dlg, values=list(self.BUILD_WIZARD_STYLE), height=38,
+                                  fg_color=FIELD, button_color=BORDER, button_hover_color=HOVER,
+                                  text_color=TEXT, font=font(13))
+        style.set("Выживание")
+        style.grid(row=5, column=0, sticky="ew", padx=20)
+        shaders = ctk.CTkCheckBox(dlg, text="Хочу шейдеры (поставит Iris)", font=font(13),
+                                  text_color=TEXT, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                  border_color=BORDER, corner_radius=6)
+        shaders.grid(row=6, column=0, sticky="w", padx=20, pady=(10, 4))
+
+        def go():
+            if pc.get() == "Слабый":
+                self.loader.set("Forge")
+                self._set_loader("Forge")
+            else:
+                self.loader.set("Fabric")
+                self._set_loader("Fabric")
+            self._set_mod_status("Собираю сборку: ставлю оптимизацию и моды под стиль…")
+            dlg.destroy()
+            slugs = ["sodium" if pc.get() != "Слабый" else "embeddium",
+                     "ferritecore", "modernfix", "entityculling"]
+            slugs += self.BUILD_WIZARD_STYLE[style.get()]
+            if shaders.get() and pc.get() != "Слабый":
+                slugs.append("iris")
+            for s in slugs:
+                self._enqueue_mod(s, s.capitalize(), self.cfg["last_version"],
+                                  self._kind_dir(), "mod")
+        ctk.CTkButton(dlg, text="🪄 Собрать и установить", height=42, corner_radius=12,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
+                      font=font(14, "bold"), command=go).grid(
+            row=7, column=0, sticky="ew", padx=20, pady=(10, 16))
+
     def mod_from_file(self):
         """Копирует .jar из файла в папку модов/паков текущей версии (ставил сам — знаю имя файла)."""
         ready = self._kind_ready()
@@ -1854,9 +2134,15 @@ class App(ctk.CTk):
         # --- тема ---
         card = self._card(scroll)
         card.grid(row=2, column=0, sticky="ew", padx=(0, 8), pady=(0, 14))
-        self._caption(card, "Цветовая тема").grid(row=0, column=0, sticky="w", padx=24, pady=(22, 10))
+        card.grid_columnconfigure(0, weight=1)
+        self._caption(card, "Оформление").grid(row=0, column=0, sticky="w", padx=24, pady=(22, 8))
+        self.mode_seg = self._segmented(card, ["Тёмная тема", "Светлая тема"],
+                                        lambda _: self._pick_mode(), height=36)
+        self.mode_seg.set("Светлая тема" if self._is_light() else "Тёмная тема")
+        self.mode_seg.grid(row=1, column=0, sticky="w", padx=24)
+        self._caption(card, "Цветовой акцент").grid(row=2, column=0, sticky="w", padx=24, pady=(12, 8))
         chips = ctk.CTkFrame(card, fg_color="transparent")
-        chips.grid(row=1, column=0, sticky="w", padx=24)
+        chips.grid(row=3, column=0, sticky="w", padx=24)
         for i, (tname, (ta, tb)) in enumerate(THEMES.items()):
             sel = tname == self.cfg.get("theme", "Мята")
             ctk.CTkButton(chips, text=tname, width=92, height=36, corner_radius=12, fg_color=ta,
@@ -1864,12 +2150,20 @@ class App(ctk.CTk):
                           border_width=3 if sel else 0, border_color=TEXT,
                           command=lambda n=tname: self._pick_theme(n)).grid(
                 row=0, column=i, padx=(0 if i == 0 else 8, 0))
+        ctk.CTkButton(chips, text="🎨 Свой цвет", width=110, height=36, corner_radius=12,
+                      border_width=1, fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
+                      text_color=TEXT, font=font(13), command=self._pick_custom_color).grid(
+            row=0, column=len(THEMES), padx=(8, 0))
+        self._caption(card, "Язык интерфейса").grid(row=4, column=0, sticky="w", padx=24, pady=(12, 4))
+        self.lang_seg = self._segmented(card, ["Русский", "English"], lambda _: self._pick_lang(), height=32)
+        self.lang_seg.set("English" if self.cfg.get("lang") == "en" else "Русский")
+        self.lang_seg.grid(row=5, column=0, sticky="w", padx=24)
         self.theme_note = ctk.CTkLabel(card, text="", font=font(12), text_color=MUTED, anchor="w")
-        self.theme_note.grid(row=2, column=0, sticky="w", padx=24, pady=(10, 0))
+        self.theme_note.grid(row=6, column=0, sticky="w", padx=24, pady=(10, 0))
         self.restart_btn = ctk.CTkButton(card, text="Перезапустить лаунчер", height=36, corner_radius=12,
                                          fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
                                          font=font(13, "bold"), command=self.restart)
-        ctk.CTkFrame(card, height=14, fg_color="transparent").grid(row=4, column=0)
+        ctk.CTkFrame(card, height=14, fg_color="transparent").grid(row=5, column=0)
 
         # --- папка ---
         card = self._card(scroll)
@@ -1906,10 +2200,33 @@ class App(ctk.CTk):
         mrow.grid(row=2, column=0, sticky="w", padx=24, pady=(12, 0))
         for text, cmd in (("Сделать бэкап сейчас", self.backup_now),
                           ("Восстановить из бэкапа", self.restore_pick),
-                          ("Перенести из .minecraft", self.import_official)):
+                          ("Перенести из .minecraft", self.import_official),
+                          ("Импорт из папки", self.import_dir_pick)):
             ctk.CTkButton(mrow, text=text, height=38, corner_radius=12, border_width=1,
                           fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
                           text_color=TEXT, font=font(13), command=cmd).pack(side="left", padx=(0, 10))
+
+        # --- Java и обслуживание ---
+        card = self._card(scroll)
+        card.grid(row=5, column=0, sticky="ew", padx=(0, 8), pady=(0, 14))
+        card.grid_columnconfigure(0, weight=1)
+        self._caption(card, "Java (установленные лаунчером)").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(22, 6))
+        self.java_list = ctk.CTkLabel(card, text="", font=font(12), text_color=MUTED,
+                                      anchor="w", justify="left", wraplength=600)
+        self.java_list.grid(row=1, column=0, sticky="ew", padx=24)
+        self._refresh_java_list()
+        jrow2 = ctk.CTkFrame(card, fg_color="transparent")
+        jrow2.grid(row=2, column=0, sticky="w", padx=24, pady=(8, 6))
+        for text, cmd in (("Удалить старые дубли Java", self.cleanup_javas),
+                          ("Освободить место (кэш, логи)", self.cleanup_disk),
+                          ("Диагностика ПК", self.diagnostics_dialog),
+                          ("Экспорт профиля", lambda: self.export_profile()),
+                          ("Импорт профиля", self.import_profile)):
+            ctk.CTkButton(jrow2, text=text, height=36, corner_radius=12, border_width=1,
+                          fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
+                          text_color=TEXT, font=font(12), command=cmd).pack(side="left", padx=(0, 8))
+        ctk.CTkFrame(card, height=8, fg_color="transparent").grid(row=3, column=0)
 
         self._caption(card, "Рендер графики").grid(
             row=3, column=0, sticky="w", padx=24, pady=(18, 6))
@@ -1927,28 +2244,60 @@ class App(ctk.CTk):
 
         # --- поведение и прочее ---
         card = self._card(scroll)
-        card.grid(row=5, column=0, sticky="ew", padx=(0, 8))
+        card.grid(row=6, column=0, sticky="ew", padx=(0, 8))
         card.grid_columnconfigure(0, weight=1)
         self._caption(card, "Поведение").grid(
             row=0, column=0, sticky="w", padx=24, pady=(22, 10))
         self.close_var = ctk.BooleanVar(value=bool(self.cfg.get("close_on_launch")))
         self.tray_var = ctk.BooleanVar(value=bool(self.cfg.get("minimize_to_tray")))
         self.autoupd_var = ctk.BooleanVar(value=bool(self.cfg.get("auto_update_mods")))
+        self.fast_var = ctk.BooleanVar(value=bool(self.cfg.get("fast_start")))
+        self.shared_var = ctk.BooleanVar(value=bool(self.cfg.get("shared_options")))
         for r, (var, text) in enumerate((
                 (self.close_var, "Закрывать лаунчер, когда игра запустилась"),
                 (self.tray_var, "Крестик сворачивает в трей (иконка возле часов)"),
-                (self.autoupd_var, "Проверять обновления модов при запуске игры")),
+                (self.autoupd_var, "Проверять обновления модов при запуске игры"),
+                (self.fast_var, "Ускоренный старт: не перепроверять файлы игры (быстрее, но без диагностики битых файлов)"),
+                (self.shared_var, "Общие настройки игры: один options.txt на все версии и сборки")),
                 start=1):
             ctk.CTkCheckBox(
                 card, text=text, variable=var, font=font(13), text_color=TEXT,
                 fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER,
                 corner_radius=6,
             ).grid(row=r, column=0, sticky="w", padx=24, pady=3)
+        self._caption(card, "Экспериментальные функции").grid(
+            row=6, column=0, sticky="w", padx=24, pady=(14, 4))
+        self.cosvar = ctk.BooleanVar(value=self._cos_on())
+        ctk.CTkCheckBox(
+            card, text="Косметика, кристаллы и 3D-персонаж (эксперимент)",
+            variable=self.cosvar, font=font(13), text_color=TEXT,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, corner_radius=6,
+        ).grid(row=7, column=0, sticky="w", padx=24, pady=3)
+        ctk.CTkLabel(card, text="Изменение вступит в силу после перезапуска",
+                     font=font(11), text_color=MUTED, anchor="w").grid(
+            row=8, column=0, sticky="w", padx=24)
+
+        self._caption(card, "Загрузка файлов Mojang (версии, ассеты)").grid(
+            row=9, column=0, sticky="w", padx=24, pady=(14, 4))
+        saved_mirror = self.cfg.get("mirror", "") or "auto"
+        self.mirror_seg = self._segmented(card, ["Авто (сам выберу быстрое)", "Официальный",
+                                                 "Зеркало BMCLAPI"], lambda _: None, height=32)
+        self.mirror_seg.set({"auto": "Авто (сам выберу быстрое)",
+                             "official": "Официальный",
+                             "bmclapi": "Зеркало BMCLAPI"}.get(saved_mirror, "Авто (сам выберу быстрое)"))
+        self.mirror_seg.grid(row=10, column=0, sticky="w", padx=24)
+        self.mirror_entry = self._entry(card, "Своя ссылка на зеркало (необязательно)")
+        if saved_mirror not in ("", "official", "bmclapi", "auto"):
+            self.mirror_entry.insert(0, saved_mirror)
+        self.mirror_entry.grid(row=11, column=0, sticky="ew", padx=24, pady=(6, 4))
+        ctk.CTkLabel(card, text="Зеркало помогает, если файлы качаются медленно или не качаются вовсе",
+                     font=font(11), text_color=MUTED, anchor="w").grid(
+            row=12, column=0, sticky="w", padx=24, pady=(0, 14))
 
         self._caption(card, "Discord Rich Presence (необязательно)").grid(
-            row=4, column=0, sticky="w", padx=24, pady=(18, 6))
+            row=13, column=0, sticky="w", padx=24, pady=(18, 6))
         drow = ctk.CTkFrame(card, fg_color="transparent")
-        drow.grid(row=5, column=0, sticky="ew", padx=24)
+        drow.grid(row=14, column=0, sticky="ew", padx=24)
         drow.grid_columnconfigure(0, weight=1)
         self.discord_entry = self._entry(drow, "Application ID из discord.com/developers")
         self.discord_entry.insert(0, self.cfg.get("discord_app_id", ""))
@@ -1956,23 +2305,23 @@ class App(ctk.CTk):
         ctk.CTkLabel(card, text="Пока ты играешь, в Discord показывается «играет в Minecraft <версия>». "
                                 "Application ID создаётся бесплатно на discord.com/developers → Applications.",
                      font=font(12), text_color=MUTED, anchor="w", justify="left",
-                     wraplength=620).grid(row=6, column=0, sticky="w", padx=24, pady=(8, 0))
+                     wraplength=620).grid(row=15, column=0, sticky="w", padx=24, pady=(8, 0))
 
         self._caption(card, "Обновление лаунчера").grid(
-            row=7, column=0, sticky="w", padx=24, pady=(18, 6))
+            row=16, column=0, sticky="w", padx=24, pady=(18, 6))
         self.update_btn = ctk.CTkButton(
             card, text="Обновить лаунчер до последней версии", height=38, corner_radius=12,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
             font=font(13, "bold"), command=self.self_update_click)
-        self.update_btn.grid(row=8, column=0, sticky="w", padx=24, pady=(0, 6))
+        self.update_btn.grid(row=17, column=0, sticky="w", padx=24, pady=(0, 6))
         self.update_note = ctk.CTkLabel(card, text="", font=font(12), text_color=MUTED,
                                         anchor="w", justify="left", wraplength=620)
-        self.update_note.grid(row=9, column=0, sticky="w", padx=24, pady=(0, 6))
+        self.update_note.grid(row=18, column=0, sticky="w", padx=24, pady=(0, 6))
         ctk.CTkButton(
             card, text="Сообщить о баге (создать вопрос на GitHub)", height=34, corner_radius=12,
             border_width=1, fg_color="transparent", hover_color=HOVER, border_color=BORDER,
             text_color=MUTED, font=font(12), command=self.report_bug,
-        ).grid(row=10, column=0, sticky="w", padx=24, pady=(0, 18))
+        ).grid(row=19, column=0, sticky="w", padx=24, pady=(0, 18))
         self.after(3000, self._refresh_update_note)
         return page
 
@@ -2013,6 +2362,174 @@ class App(ctk.CTk):
     def import_official(self):
         self._set_status("Перенос из .minecraft…")
         self._maintenance_worker(import_from_official, "Перенос завершён")
+
+    def import_dir_pick(self):
+        src = filedialog.askdirectory(
+            title="Выбери папку лаунчера (где лежат saves/, mods/ и т.п.)")
+        if not src:
+            return
+        self._set_status("Перенос из выбранной папки…")
+        self._maintenance_worker(
+            lambda gd, status: import_from_dir(src, gd, status), "Перенос завершён")
+
+    # --- Java-менеджер и обслуживание ---
+    def _runtime_javas(self):
+        from java_finder import java_major
+        out = []
+        if RUNTIME_DIR.exists():
+            for d in sorted(RUNTIME_DIR.iterdir()):
+                if d.is_dir() and d.name.startswith("java"):
+                    exe = next(d.rglob("bin/java.exe" if os.name == "nt" else "bin/java"), None)
+                    if exe:
+                        out.append((d, java_major(exe)))
+        return out
+
+    def _refresh_java_list(self):
+        if not hasattr(self, "java_list"):
+            return
+        items = self._runtime_javas()
+        if not items:
+            self.java_list.configure(text="Пока ничего не установлено — Java скачается "
+                                          "при первом запуске нужной версии")
+            return
+        lines, total = [], 0
+        for d, major in items:
+            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) // (1024 * 1024)
+            total += size
+            lines.append(f"• Java {major} ({d.name}) — {size} МБ")
+        lines.append(f"Всего: {total} МБ")
+        self.java_list.configure(text="\n".join(lines))
+
+    def cleanup_javas(self):
+        import shutil
+        by_major = {}
+        for d, major in self._runtime_javas():
+            by_major.setdefault(major, []).append(d)
+        removed = 0
+        for major, dirs in by_major.items():
+            for d in dirs[:-1]:  # свежая (по имени папки) остаётся
+                try:
+                    shutil.rmtree(d)
+                    removed += 1
+                except OSError:
+                    pass
+        self._refresh_java_list()
+        self._set_status(f"Удалено дублирующихся Java: {removed}" if removed
+                         else "Дублей нет — и так компактно")
+
+    def cleanup_disk(self):
+        import shutil
+        freed = [0]
+
+        def wipe(path):
+            path = Path(path)
+            if not path.exists():
+                return
+            size = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+            shutil.rmtree(path, ignore_errors=True)
+            freed[0] += size
+        wipe(CACHE_DIR / "icons")
+        wipe(CACHE_DIR / "forge")
+        wipe(CACHE_DIR / "neoforge")
+        wipe(NATIVES_DIR)
+        if LOGS_DIR.exists():
+            for old in sorted(LOGS_DIR.glob("game_*.log"))[:-5]:
+                try:
+                    freed[0] += old.stat().st_size
+                    old.unlink()
+                except OSError:
+                    pass
+        self._refresh_java_list()
+        self._set_status(f"Освобождено: {freed[0] // (1024 * 1024)} МБ "
+                         f"(кэш иконок/установщиков, natives, старые логи)")
+
+    def diagnostics_dialog(self):
+        lines = []
+        try:
+            if sys.platform.startswith("win"):
+                import ctypes
+                class MS(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong),
+                                ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong),
+                                ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong),
+                                ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+                st = MS()
+                st.dwLength = ctypes.sizeof(MS)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+                lines.append(f"Память: свободно {st.ullAvailPhys // (1024 ** 3)} ГБ "
+                             f"из {st.ullTotalPhys // (1024 ** 3)} ГБ")
+                if st.ullAvailPhys // (1024 ** 3) < 4:
+                    lines.append("   💡 Свободной памяти мало — закрой лишние программы")
+            else:
+                lines.append(f"Память: всего {total_ram_mb() // 1024} ГБ")
+        except Exception:
+            lines.append("Память: не удалось определить")
+        try:
+            du = shutil.disk_usage(DATA)
+            lines.append(f"Диск: свободно {du.free // (1024 ** 3)} ГБ")
+            if du.free // (1024 ** 3) < 5:
+                lines.append("   💡 На диске мало места — игра может не поставиться")
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("win"):
+                out = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"],
+                                     capture_output=True, text=True, errors="replace",
+                                     timeout=10).stdout
+                gpu = " / ".join(x.strip() for x in out.splitlines()[1:] if x.strip()) or "?"
+                lines.append(f"Видеокарта: {gpu}")
+        except Exception:
+            pass
+        javas = self._runtime_javas()
+        lines.append(f"Java установлено: {len(javas)}"
+                     + (f" (версии: {', '.join(str(m) for _, m in javas)})" if javas else ""))
+        lines.append(f"Всего в игре: {fmt_time(float(self.cfg.get('playtime_hours', 0)) * 3600)}")
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Диагностика ПК")
+        dlg.geometry("560x380")
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.after(250, lambda: (dlg.lift(), dlg.focus_force(), dlg.grab_set()))
+        dlg.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(dlg, text="🩺 Диагностика ПК", font=font(20, "bold"),
+                     text_color=TEXT).grid(row=0, column=0, sticky="w", padx=20, pady=(16, 6))
+        ctk.CTkLabel(dlg, text="\n".join(lines), font=font(13), text_color=TEXT, anchor="w",
+                     justify="left", wraplength=500).grid(row=1, column=0, sticky="ew", padx=20)
+        ctk.CTkButton(dlg, text="Понятно", height=38, corner_radius=12, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT, font=font(13, "bold"),
+                      command=dlg.destroy).grid(row=2, column=0, sticky="ew", padx=20, pady=12)
+
+    def export_profile(self):
+        import json as _json
+        dest = filedialog.asksaveasfilename(
+            title="Куда сохранить профиль", defaultextension=".json",
+            initialfile="yrovee_profile.json", filetypes=[("Профиль", "*.json")])
+        if not dest:
+            return
+        data = {k: v for k, v in self.cfg.items() if k != "accounts"}  # токены не выносим
+        Path(dest).write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._set_status(f"Профиль сохранён: {dest} (без токенов аккаунтов)")
+
+    def import_profile(self):
+        import json as _json
+        src = filedialog.askopenfilename(title="Файл профиля", filetypes=[("Профиль", "*.json")])
+        if not src:
+            return
+        try:
+            data = _json.loads(Path(src).read_text(encoding="utf-8"))
+            for key in ("theme", "theme_mode", "custom_color", "ram_mb", "extra_jvm_args",
+                        "perf_preset", "cosmetics", "crystals", "play_history", "stats",
+                        "builds", "servers", "quests", "season", "lang", "mirror"):
+                if key in data:
+                    self.cfg[key] = data[key]
+            save_config(self.cfg)
+            self._set_status("Профиль импортирован — перезапусти лаунчер", ACCENT)
+        except Exception as e:
+            self._set_status(f"Не удалось импортировать: {e}", ERROR)
 
     # --- рендер Vulkan ---
     def _vulkan_pid(self):
@@ -2126,7 +2643,38 @@ class App(ctk.CTk):
         self.cfg["theme"] = name
         save_config(self.cfg)
         self.theme_note.configure(text=f"Тема «{name}» применится после перезапуска")
-        self.restart_btn.grid(row=3, column=0, sticky="w", padx=24, pady=(10, 0))
+        self.restart_btn.grid(row=7, column=0, sticky="w", padx=24, pady=(10, 0))
+
+    def _pick_custom_color(self):
+        from tkinter import simpledialog
+        color = simpledialog.askstring(
+            "Свой цвет", "Введи цвет в формате #RRGGBB (например #7c5cff):",
+            initialvalue=self.cfg.get("custom_color", "#7c5cff"), parent=self)
+        if not color:
+            return
+        color = color.strip()
+        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", color):
+            self.theme_note.configure(text="Неверный формат — нужен #RRGGBB", text_color=ERROR)
+            return
+        if not color.startswith("#"):
+            color = "#" + color
+        self.cfg["custom_color"] = color
+        self.cfg["theme"] = "Свой цвет"
+        save_config(self.cfg)
+        self.theme_note.configure(text="Свой цвет применится после перезапуска")
+        self.restart_btn.grid(row=7, column=0, sticky="w", padx=24, pady=(10, 0))
+
+    def _pick_lang(self):
+        self.cfg["lang"] = "en" if self.lang_seg.get() == "English" else "ru"
+        save_config(self.cfg)
+        self.theme_note.configure(text="Язык применится после перезапуска")
+        self.restart_btn.grid(row=7, column=0, sticky="w", padx=24, pady=(10, 0))
+
+    def _pick_mode(self):
+        self.cfg["theme_mode"] = "light" if self.mode_seg.get() == "Светлая тема" else "dark"
+        save_config(self.cfg)
+        self.theme_note.configure(text="Оформление применится после перезапуска")
+        self.restart_btn.grid(row=6, column=0, sticky="w", padx=24, pady=(10, 0))
 
     def restart(self):
         self.save_all()
@@ -2166,6 +2714,17 @@ class App(ctk.CTk):
             c["close_on_launch"] = bool(self.close_var.get())
             c["minimize_to_tray"] = bool(self.tray_var.get())
             c["auto_update_mods"] = bool(self.autoupd_var.get())
+            c["fast_start"] = bool(self.fast_var.get())
+            c["shared_options"] = bool(self.shared_var.get())
+            c["cosmetics_enabled"] = bool(self.cosvar.get())
+        if hasattr(self, "mirror_entry"):
+            custom = self.mirror_entry.get().strip()
+            if custom:
+                c["mirror"] = custom
+            else:
+                c["mirror"] = {"Авто (сам выберу быстрое)": "auto",
+                               "Официальный": "official",
+                               "Зеркало BMCLAPI": "bmclapi"}.get(self.mirror_seg.get(), "auto")
         if hasattr(self, "discord_entry"):
             c["discord_app_id"] = self.discord_entry.get().strip()
         save_config(c)
@@ -2228,6 +2787,7 @@ class App(ctk.CTk):
                 site = parse_site_data(text)
                 self.q.put(("whatsnew", site.get("changelog", [])))
                 self.q.put(("site_promos", site.get("promos", {})))
+                self.q.put(("site_news", site.get("news", [])))
             except Exception:
                 pass
         except Exception:
@@ -2325,6 +2885,8 @@ class App(ctk.CTk):
             def files_progress(done, total):
                 q.put(("progress", done / total if total else 1,
                        f"Скачивание файлов: {done} / {total}"))
+                if done % 25 == 0:
+                    q.put(("log", f"[загрузка] {done} / {total} файлов\n"))
 
             def java_progress(done, total):
                 if total:
@@ -2346,26 +2908,41 @@ class App(ctk.CTk):
                 launch_id = install_quilt(version)
             elif loader == "Forge":
                 q.put(("status", "Загрузка Minecraft…"))
-                install_version(version, files_progress)
+                install_version(version, files_progress, quick=bool(cfg.get("fast_start")))
                 q.put(("status", "Проверка Java…"))
                 java0 = ensure_java(required_java(version), cfg["java_path"], java_progress)
                 launch_id = ensure_forge(version, java0, cfg.get("forge_version") or None,
                                          status=lambda t: q.put(("status", t)))
             elif loader == "NeoForge":
                 q.put(("status", "Загрузка Minecraft…"))
-                install_version(version, files_progress)
+                install_version(version, files_progress, quick=bool(cfg.get("fast_start")))
                 q.put(("status", "Проверка Java…"))
                 java0 = ensure_java(required_java(version), cfg["java_path"], java_progress)
                 launch_id = ensure_neoforge(version, java0, cfg.get("forge_version") or None,
                                             status=lambda t: q.put(("status", t)))
 
             q.put(("status", "Загрузка версии…"))
-            install_version(launch_id, files_progress)
+            install_version(launch_id, files_progress, quick=bool(cfg.get("fast_start")))
 
             q.put(("status", "Проверка Java…"))
             java = ensure_java(required_java(launch_id), cfg["java_path"], java_progress)
 
             apply_local_skin(acc, Path(cfg["game_dir"]))
+            if cfg.get("shared_options"):
+                master = INSTANCES_DIR / "shared_options.txt"
+                opts = Path(cfg["game_dir"]) / "options.txt"
+                try:
+                    if not master.exists() and opts.exists():
+                        shutil.copyfile(opts, master)
+                    elif master.exists():
+                        shutil.copyfile(master, opts)
+                except Exception:
+                    pass
+            m = re.match(r"1\.(\d+)(?:\.(\d+))?", version)
+            if m and (int(m.group(1)), int(m.group(2) or 0)) < (1, 8):
+                cfg["extra_jvm_args"] = (cfg.get("extra_jvm_args", "") +
+                    " -Dfml.ignoreInvalidMinecraftCertificates=true"
+                    " -Dfml.ignorePatchDiscrepancies=true").strip()
             if cfg.get("backup_on_launch"):
                 backup_saves(cfg["game_dir"], status=lambda t: q.put(("status", t)))
             q.put(("status", "Запуск игры…"))
@@ -2386,6 +2963,14 @@ class App(ctk.CTk):
                 q.put(("log", line))
             code = proc.wait()
             q.put(("played", f"{version} · {loader}", acc["name"], time.time() - started))
+            if cfg.get("shared_options"):
+                try:
+                    opts = Path(cfg["game_dir"]) / "options.txt"
+                    master = INSTANCES_DIR / "shared_options.txt"
+                    if opts.exists():
+                        shutil.copyfile(opts, master)
+                except Exception:
+                    pass
             if code == 0:
                 q.put(("finished", "Игра закрыта", False))
             else:
@@ -2532,14 +3117,17 @@ class App(ctk.CTk):
             self._set_status(msg[2])
         elif kind == "running":
             self.progress.set(0)
-            self._set_busy(True, "Игра запущена")
+            self.active_games += 1
+            self._set_busy(False, "▶ Запустить ещё одну")
             self._set_status("Игра запущена. Приятной игры!", ACCENT)
             self.cfg["stats"]["launches"] = self.cfg["stats"].get("launches", 0) + 1
             cos.bump_counter(self.cfg, "launches")
             save_config(self.cfg)
         elif kind == "finished":
             self.progress.set(0)
-            self._set_busy(False)
+            self.active_games = max(0, self.active_games - 1)
+            self._set_busy(self.active_games > 0,
+                           "Игра запущена" if self.active_games > 0 else "Играть")
             self._set_status(msg[1], ERROR if msg[2] else MUTED)
         elif kind == "played":
             st = self.cfg["stats"]
@@ -2605,6 +3193,12 @@ class App(ctk.CTk):
             self._update_profile()
         elif kind == "site_promos":
             self.site_promos = msg[1] or {}
+        elif kind == "site_news":
+            self.site_news = msg[1] or []
+            self._show_news(self.site_news)
+        elif kind == "char_status":
+            if "char" in self.pages:
+                self.pages["char"].set_status(msg[1], msg[2])
         elif kind == "close_app":
             self.on_close()
         elif kind == "launch_minimize":
@@ -2701,6 +3295,17 @@ class App(ctk.CTk):
 
 
 def run():
-    ctk.set_appearance_mode("dark")
-    apply_theme(load_config().get("theme", "Мята"))
+    strings.set_lang(load_config().get("lang", "ru"))
+    ctk.set_appearance_mode("dark" if load_config().get("theme_mode", "dark") == "dark" else "light")
+    apply_theme()
+    net.MIRROR = _mirror_base(load_config().get("mirror", ""))
     App().mainloop()
+
+
+def _mirror_base(value):
+    """"" / "bmclapi" / своя ссылка -> база зеркала или ""."""
+    if not value or value == "official":
+        return ""
+    if value == "bmclapi":
+        return "https://bmclapi2.bangbang93.com"
+    return value if value.startswith("http") else ""

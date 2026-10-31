@@ -88,6 +88,14 @@ def install_mod(project_id, game_version, loader, dest_dir, status=None, _stack=
     project = get_json(f"{API}/project/{project_id}")
     pid = project["id"]  # project_id может быть и slug'ом
     title = project["title"]
+    # конфликт с уже установленным — проверяем ДО скачивания
+    registry = list_installed(dest_dir)
+    if pid in registry:
+        raise RuntimeError(f"«{title}» уже установлен")
+    for other_pid, info in registry.items():
+        if pid in info.get("incompatible", []):
+            raise RuntimeError(f"«{title}» конфликтует с установленным "
+                               f"«{info['title']}» — сначала удали один из них")
     version = _pick_version(pid, game_version, _loaders_for(kind, loader))
     if version is None:
         raise RuntimeError(f"У «{title}» нет версии под {game_version}")

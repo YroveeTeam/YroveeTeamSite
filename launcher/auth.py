@@ -16,6 +16,7 @@ XBL_URL = "https://user.auth.xboxlive.com/user/authenticate"
 XSTS_URL = "https://xsts.auth.xboxlive.com/xsts/authorize"
 MC_LOGIN_URL = "https://api.minecraftservices.com/authentication/login_with_xbox"
 MC_PROFILE_URL = "https://api.minecraftservices.com/minecraft/profile"
+MC_SKIN_URL = "https://api.minecraftservices.com/minecraft/profile/skins"
 
 ERRORS = {
     "authorization_declined": "Вход отклонён в браузере",
@@ -205,3 +206,20 @@ def skin_by_nick(name):
         return tex.get("textures", {}).get("SKIN", {}).get("url")
     except Exception:
         return None
+
+
+def upload_skin(mc_token, png_path, variant="classic"):
+    """Ставит PNG скином лицензионного аккаунта. Возвращает текст ошибки или None."""
+    from pathlib import Path
+    with open(Path(png_path), "rb") as f:
+        r = session.put(MC_SKIN_URL,
+                        headers={"Authorization": "Bearer " + mc_token},
+                        data={"variant": variant},
+                        files={"file": ("skin.png", f, "image/png")}, timeout=60)
+    if r.status_code in (200, 204):
+        return None
+    try:
+        msg = r.json().get("errorMessage", "")
+    except Exception:
+        msg = ""
+    return f"Mojang ответил {r.status_code}: {msg or 'не удалось загрузить скин'}"

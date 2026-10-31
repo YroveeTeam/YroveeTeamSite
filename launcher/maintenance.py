@@ -56,13 +56,15 @@ def restore_backup(zip_path, game_dir):
     return restored
 
 
-def import_from_official(game_dir, status=None):
-    """Переносит сохранения, servers.dat и options.txt из %APPDATA%\\.minecraft.
-    Существующие файлы не трогает. Возвращает краткий отчёт."""
+def import_from_dir(src_root, game_dir, status=None):
+    """Переносит сохранения/серверы/настройки из папки другого лаунчера
+    (.minecraft-подобная структура). Существующие файлы не трогает."""
     say = status or (lambda t: None)
-    src_root = Path(os.environ.get("APPDATA", str(Path.home()))) / ".minecraft"
-    if not src_root.is_dir():
-        raise RuntimeError("Папка .minecraft не найдена — официальный лаунчер не установлен?")
+    src_root = Path(src_root)
+    if not (src_root / "saves").is_dir() and not (src_root / "options.txt").exists() \
+            and not (src_root / "servers.dat").exists():
+        raise RuntimeError("В этой папке нет saves/, options.txt или servers.dat — "
+                           "похоже, это не папка лаунчера")
 
     game_dir = Path(game_dir)
     game_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +83,7 @@ def import_from_official(game_dir, status=None):
             n += 1
         return n
 
-    for name in ("saves", "screenshots", "resourcepacks", "shaderpacks"):
+    for name in ("saves", "screenshots", "resourcepacks", "shaderpacks", "mods"):
         src = src_root / name
         if src.is_dir():
             say(f"Переношу {name}…")
@@ -101,5 +103,14 @@ def import_from_official(game_dir, status=None):
         copied.append("options.txt")
 
     if not copied:
-        return "В .minecraft не нашлось ничего нового — всё уже перенесено."
+        return "В этой папке не нашлось ничего нового — всё уже перенесено."
     return "Перенесено: " + ", ".join(copied) + "."
+
+
+def import_from_official(game_dir, status=None):
+    """Переносит данные из официального .minecraft (обёртка над import_from_dir)."""
+    import os
+    src_root = Path(os.environ.get("APPDATA", str(Path.home()))) / ".minecraft"
+    if not src_root.is_dir():
+        raise RuntimeError("Папка .minecraft не найдена — официальный лаунчер не установлен?")
+    return import_from_dir(src_root, game_dir, status)

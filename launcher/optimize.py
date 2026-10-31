@@ -1,14 +1,24 @@
 """Оптимизация игры: профили JVM, подбор памяти и набор модов-ускорителей."""
 
-_G1 = ["-XX:+UnlockExperimentalVMOptions", "-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled",
-       "-XX:MaxGCPauseMillis=130", "-XX:G1NewSizePercent=30", "-XX:G1ReservePercent=20",
-       "-XX:+DisableExplicitGC"]
+# Флаги против фризов при очистке памяти: короткие паузы G1 (по мотивам
+# флагов Aikar) + память выделяется сразу целиком (-Xms = -Xmx + AlwaysPreTouch),
+# чтобы Java не расширяла кучу на лету — именно такие расширения дают резкие
+# подлагивания при сборке мусора.
+_G1 = ["-XX:+UnlockExperimentalVMOptions", "-XX:+UseG1GC",
+       "-XX:G1NewSizePercent=30", "-XX:G1MaxNewSizePercent=40",
+       "-XX:MaxGCPauseMillis=50", "-XX:G1HeapRegionSize=16M",
+       "-XX:G1ReservePercent=20", "-XX:G1MixedGCCountTarget=4",
+       "-XX:InitiatingHeapOccupancyPercent=15",
+       "-XX:+ParallelRefProcEnabled", "-XX:+DisableExplicitGC",
+       "-XX:AlwaysPreTouch"]
 
 PRESETS = {
     "Стандарт": ("Без дополнительных флагов — как у обычного лаунчера.", []),
-    "Баланс": ("Сборщик мусора G1 с короткими паузами: меньше подлагиваний при загрузке чанков.", _G1),
-    "Макс. FPS": ("Как «Баланс», но память выделяется сразу целиком: кучу не нужно расширять на лету. "
-                  "Основной прирост FPS даёт кнопка «Оптимизировать» на вкладке модов.",
+    "Баланс": ("Короткие паузы сборщика мусора: меньше фризов при очистке памяти. "
+               "Память выделяется сразу целиком, куча не растёт на лету.",
+               _G1 + ["-Xms{ram}M"]),
+    "Макс. FPS": ("То же, что «Баланс»: основной прирост FPS даёт кнопка "
+                  "«Оптимизировать» на вкладке модов.",
                   _G1 + ["-Xms{ram}M"]),
     "Слабый ПК": ("Лёгкий сборщик мусора для компьютеров с 2–4 ядрами. Не ставь много памяти.",
                   ["-XX:+UseSerialGC", "-XX:+DisableExplicitGC"]),

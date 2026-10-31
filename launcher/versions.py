@@ -6,7 +6,7 @@ import sys
 import zipfile
 
 from config import VERSIONS_DIR, LIBRARIES_DIR, ASSETS_DIR, NATIVES_DIR, CACHE_DIR
-from net import get_json, download_file, download_many
+from net import apply_mirror, get_json, download_file, download_many
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 RESOURCES_URL = "https://resources.download.minecraft.net"
@@ -64,10 +64,10 @@ def download_version_json(version_id):
     path = version_json_path(version_id)
     if path.exists():
         return path
-    manifest = get_json(MANIFEST_URL)
+    manifest = get_json(apply_mirror(MANIFEST_URL))
     for v in manifest["versions"]:
         if v["id"] == version_id:
-            download_file(v["url"], path, sha1=v.get("sha1"))
+            download_file(apply_mirror(v["url"]), path, sha1=v.get("sha1"))
             return path
     raise ValueError(f"Версия {version_id} не найдена")
 
@@ -176,7 +176,9 @@ def extract_natives(data):
 
 # ---------- установка версии ----------
 
-def install_version(version_id, progress=None):
+def install_version(version_id, progress=None, quick=False):
+    """quick=True: существующие файлы совпадающего размера не перепроверяются
+    по sha1 — старт заметно быстрее, но битый файл не заметит."""
     data = load_version(version_id)
     tasks = []
 
@@ -184,7 +186,7 @@ def install_version(version_id, progress=None):
     jar_id = data["_jar_id"]
     client = data["downloads"]["client"]
     tasks.append({
-        "url": client["url"],
+        "url": apply_mirror(client["url"]),
         "dest": VERSIONS_DIR / jar_id / f"{jar_id}.jar",
         "sha1": client["sha1"],
         "size": client["size"],
@@ -200,7 +202,7 @@ def install_version(version_id, progress=None):
         cls = native_classifier(lib)
         if cls:
             tasks.append({
-                "url": cls["url"],
+                "url": apply_mirror(cls["url"]),
                 "dest": LIBRARIES_DIR / cls["path"],
                 "sha1": cls.get("sha1"),
                 "size": cls.get("size"),
@@ -209,23 +211,23 @@ def install_version(version_id, progress=None):
     # ассеты (звуки, языки, иконки)
     ai = data["assetIndex"]
     index_path = ASSETS_DIR / "indexes" / f"{ai['id']}.json"
-    download_file(ai["url"], index_path, ai.get("sha1"), ai.get("size"))
+    download_file(apply_mirror(ai["url"]), index_path, ai.get("sha1"), ai.get("size"))
     index = json.loads(index_path.read_text(encoding="utf-8"))
     for obj in index["objects"].values():
         h = obj["hash"]
         tasks.append({
-            "url": f"{RESOURCES_URL}/{h[:2]}/{h}",
+            "url": apply_mirror(f"{RESOURCES_URL}/{h[:2]}/{h}"),
             "dest": ASSETS_DIR / "objects" / h[:2] / h,
             "size": obj["size"],
         })
 
-    download_many(tasks, progress)
+    download_many(tasks, progress, quick=quick)
     extract_natives(data)
 
 
 def get_all_versions():
     """[(id, type), ...] из манифеста Mojang, новые версии первыми."""
-    manifest = get_json(MANIFEST_URL)
+    manifest = get_json(apply_mirror(MANIFEST_URL))
     result = [(v["id"], v["type"]) for v in manifest["versions"]]
     try:  # кэш на случай, когда в следующий раз не будет сети
         CACHE_DIR.mkdir(parents=True, exist_ok=True)

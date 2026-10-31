@@ -24,7 +24,7 @@ BACKUPS_DIR = DATA / "backups"  # бэкапы миров по инстанса�
 CONFIG_FILE = DATA / "config.json"
 
 LAUNCHER_NAME = "YroveeLauncher"
-LAUNCHER_VERSION = "0.11"
+LAUNCHER_VERSION = "0.13"
 
 # Клиентское приложение Azure для входа через Microsoft.
 # Создай бесплатно на portal.azure.com (App registrations → Accounts in any
@@ -50,6 +50,15 @@ DEFAULT_CONFIG = {
     "stats": {"launches": 0, "by_version": {}, "by_account": {}},
     "backup_on_launch": False,
     "discord_app_id": "",  # Application ID из Discord Developer Portal для Rich Presence
+    "cosmetics_enabled": True,  # косметика, кристаллы и 3D-персонаж (эксперимент)
+    "theme_mode": "dark",       # dark | light
+    "theme": "Мята",            # имя акцента или "Свой цвет"
+    "custom_color": "#7c5cff",  # цвет для «Свой цвет»
+    "lang": "ru",               # ru | en
+    "mirror": "auto",           # auto | official | bmclapi | своя ссылка
+    "fast_start": False,        # не перепроверять файлы перед запуском
+    "shared_options": False,    # один options.txt на все версии
+    "window_geometry": "",      # размер и позиция окна
     "close_on_launch": False,   # закрывать лаунчер, когда игра запустилась
     "minimize_to_tray": False,  # крестик сворачивает в трей вместо выхода
     "auto_update_mods": False,  # молча проверять обновления модов при запуске
@@ -65,6 +74,9 @@ DEFAULT_CONFIG = {
     "quests_claimed": [],
     "daily_play": {},           # время игры за сегодня (сундуки за игру)
     "daily_chests": {},         # сколько сундуков за игру забрано сегодня
+    "play_history": {},         # секунды игры по дням (график статистики)
+    "season": {},               # сезонный пропуск: старт и полученные дни
+    "advent": {},               # адвент-календарь: год и открытые дверцы
 }
 
 

@@ -333,11 +333,11 @@ def skin_face(path, size=40):
     return round_corners(face.resize((size * S, size * S), RS.NEAREST), 10 * S)
 
 
-def lobby_backdrop(w, h, character=None, accent="#4ade80"):
-    """Фон лобби в стиле современных лаунчеров: лучи из центра, блёстки,
-    посередине — персонаж (RGBA или None). Возвращает RGBA."""
+def lobby_backdrop(w, h, character=None, accent="#4ade80", light=False):
+    """Фон лобби: лучи из центра, блёстки, посередине — персонаж. light = светлая тема."""
     W, H = max(w, 64), max(h, 64)
-    bg = Image.new("RGBA", (W, H), (11, 13, 19, 255))
+    bgc = (246, 245, 243) if light else (11, 13, 19)
+    bg = Image.new("RGBA", (W, H), bgc + (255,))
     d = ImageDraw.Draw(bg, "RGBA")
     cx, cy = W // 2, int(H * 0.44)
     acc = hex_rgb(accent)
@@ -347,16 +347,16 @@ def lobby_backdrop(w, h, character=None, accent="#4ade80"):
     for i in range(n):
         ang = i / n * math.tau
         spread = math.tau / n * 0.30
-        far = int(math.hypot(W, H))
-        alpha = 14 if i % 2 else 22
+        alpha = (9 if i % 2 else 16) if light else (14 if i % 2 else 22)
+        shade = (20, 20, 24) if light else (255, 255, 255)
         pts = [(cx, cy),
                (cx + math.cos(ang - spread) * far, cy + math.sin(ang - spread) * far),
                (cx + math.cos(ang + spread) * far, cy + math.sin(ang + spread) * far)]
-        d.polygon(pts, fill=(255, 255, 255, alpha))
+        d.polygon(pts, fill=shade + (alpha,))
     # мягкое свечение за персонажем
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ImageDraw.Draw(glow).ellipse((cx - W // 4, cy - W // 4, cx + W // 4, cy + W // 4),
-                                 fill=acc + (36,))
+                                 fill=acc + (30 if light else 36,))
     bg = Image.alpha_composite(bg, glow.filter(ImageFilter.GaussianBlur(60)))
     d = ImageDraw.Draw(bg, "RGBA")
     # блёстки
@@ -364,15 +364,21 @@ def lobby_backdrop(w, h, character=None, accent="#4ade80"):
     for _ in range(max(30, W * H // 9000)):
         x, y = rnd.randrange(W), rnd.randrange(H)
         s = rnd.choice((2 * S, 3 * S, 4 * S))
-        col = (255, 255, 255) if rnd.random() < 0.7 else acc
-        d.rectangle((x, y, x + s, y + s), fill=col + (rnd.randrange(40, 140),))
+        if light:
+            col = (28, 25, 22) if rnd.random() < 0.7 else acc
+            a = rnd.randrange(30, 90)
+        else:
+            col = (255, 255, 255) if rnd.random() < 0.7 else acc
+            a = rnd.randrange(40, 140)
+        d.rectangle((x, y, x + s, y + s), fill=col + (a,))
     if character is not None:
         ch = character
         target_h = int(H * 0.86)
         tw = int(ch.width * target_h / ch.height)
         ch = ch.resize((tw, target_h), RS.LANCZOS)
         shadow = Image.new("RGBA", (tw * 2, target_h // 5), (0, 0, 0, 0))
-        ImageDraw.Draw(shadow).ellipse((tw // 3, 0, tw + tw // 3, target_h // 5), fill=(0, 0, 0, 90))
+        ImageDraw.Draw(shadow).ellipse((tw // 3, 0, tw + tw // 3, target_h // 5),
+                                       fill=(0, 0, 0, 70 if light else 90))
         bg.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(8)), (cx - tw, int(H * 0.95)))
         bg.alpha_composite(ch, (cx - tw // 2, int(H * 0.97) - target_h))
     return round_corners(bg, 22 * S)

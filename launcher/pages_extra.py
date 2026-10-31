@@ -9,6 +9,7 @@ import customtkinter as ctk
 from PIL import Image, ImageOps
 
 import gui as G  # цвета читаем как G.ACCENT в момент вызова: тема может меняться
+import strings
 import visuals
 from config import INSTANCES_DIR
 from modrinth import search_mods
@@ -37,7 +38,7 @@ class BasePage(ctk.CTkFrame):
         super().__init__(app.content, fg_color="transparent")
         self.app = app
         self.grid_columnconfigure(0, weight=1)
-        self.subtitle = app._title(self, title, subtitle)
+        self.subtitle = app._title(self, strings.T(title), strings.T(subtitle))
 
     def on_show(self):
         pass
@@ -456,7 +457,7 @@ class LogPage(BasePage):
 
         mono = "Consolas" if sys.platform.startswith("win") else "Courier"
         self.box = ctk.CTkTextbox(self, fg_color=G.FIELD, border_width=1, border_color=G.BORDER,
-                                  corner_radius=14, text_color="#c7d0e0", font=(mono, 12), wrap="none",
+                                  corner_radius=14, text_color=G.TEXT, font=(mono, 12), wrap="none",
                                   state="disabled")
         self.box.grid(row=4, column=0, sticky="nsew")
         self.append("Лог появится здесь после запуска игры.\n")
@@ -679,6 +680,10 @@ class StatsPage(BasePage):
         self.t_time = app._tile(tiles, "Всего в игре", 0)
         self.t_runs = app._tile(tiles, "Запусков", 1)
         self.t_fav = app._tile(tiles, "Любимая версия", 2)
+        ctk.CTkButton(tiles, text="💾 Сохранить картинку", height=44, corner_radius=12,
+                      border_width=1, fg_color=G.FIELD, hover_color=G.HOVER,
+                      border_color=G.BORDER, text_color=G.TEXT, font=G.font(13),
+                      command=self._export_image).grid(row=0, column=3, sticky="ew", padx=(12, 0))
         self.body = self.scroll(3)
         self.body.grid_columnconfigure(0, weight=1)
 
@@ -690,10 +695,103 @@ class StatsPage(BasePage):
         self.t_time.configure(text=fmt_time(sum(by_v.values())))
         self.t_runs.configure(text=str(st.get("launches", 0)))
         self.t_fav.configure(text=max(by_v, key=by_v.get) if by_v else "—")
+        self._chart()
         if not by_v:
             return self.hint(self.body, "Пока пусто", "Сыграй пару минут — и тут появятся цифры")
-        self._section("По версиям", by_v, 0)
-        self._section("По аккаунтам", by_a, 1)
+        self._section("По версиям", by_v, 1)
+        self._section("По аккаунтам", by_a, 2)
+
+    def _export_image(self):
+        """Красивая PNG-картинка со статистикой — сохранить и похвастаться."""
+        import datetime
+        from PIL import Image, ImageDraw
+        app = self.app
+        st = app.cfg["stats"]
+        by_v = st.get("by_version", {})
+        dest = filedialog.asksaveasfilename(
+            title="Куда сохранить картинку", defaultextension=".png",
+            initialfile="yrovee_stats.png", filetypes=[("PNG", "*.png")])
+        if not dest:
+            return
+        W, H = 900, 560
+        S = 2
+        img = Image.new("RGBA", (W * S, H * S), (11, 13, 19, 255))
+        d = ImageDraw.Draw(img)
+        acc = G.hex_rgb(G.ACCENT)
+        d.rounded_rectangle((20 * S, 20 * S, (W - 20) * S, (H - 20) * S), radius=18 * S,
+                            outline=acc + (255,), width=2 * S)
+        d.text((50 * S, 44 * S), "YroveeLauncher — моя статистика", font=visuals.pil_font(30 * S, True),
+               fill=(238, 241, 247, 255))
+        d.text((50 * S, 90 * S), datetime.date.today().strftime("%d.%m.%Y"),
+               font=visuals.pil_font(15 * S), fill=(138, 147, 166, 255))
+        total = fmt_time(sum(by_v.values()))
+        d.text((50 * S, 140 * S), f"Всего в игре: {total}", font=visuals.pil_font(20 * S, True),
+               fill=(74, 222, 128, 255))
+        d.text((50 * S, 180 * S), f"Запусков: {st.get('launches', 0)}   ·   "
+               f"Уровень: {__import__('cosmetics').level_of(app.cfg)}",
+               font=visuals.pil_font(16 * S), fill=(238, 241, 247, 255))
+        top = sorted(by_v.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        d.text((50 * S, 240 * S), "Любимые версии:", font=visuals.pil_font(16 * S, True),
+               fill=(238, 241, 247, 255))
+        for i, (name, secs) in enumerate(top):
+            d.text((50 * S, (280 + i * 36) * S), f"{name} — {fmt_time(secs)}",
+                   font=visuals.pil_font(15 * S), fill=(199, 208, 224, 255))
+        try:
+            ch = app.pages["char"]
+            skin = ch._skin_bytes()
+            if skin:
+                import skin3d as S3
+                import cosmetics as C
+                im = S3.render_3d(skin, C.equipped(app.cfg), yaw=-0.32, pitch=-0.08, height=340)
+                im = im.resize((int(im.width * 1.6), 340 * 1), Image.Resampling.LANCZOS)
+                img.alpha_composite(im, ((W - im.width - 60) * S, 60 * S))
+        except Exception:
+            pass
+        d.text((50 * S, (H - 60) * S), "сделано в YroveeLauncher",
+               font=visuals.pil_font(13 * S), fill=(120, 128, 145, 255))
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+        img.convert("RGB").save(dest)
+        app._set_status(f"Картинка сохранена: {dest}", G.ACCENT)
+
+    def _chart(self):
+        """Столбики времени игры за последние 14 дней (рисуются Pillow)."""
+        import datetime
+        from PIL import Image, ImageDraw
+        hist = self.app.cfg.get("play_history", {})
+        days = [(datetime.date.today() - datetime.timedelta(days=i)) for i in range(13, -1, -1)]
+        vals = [int(hist.get(d.isoformat(), 0)) for d in days]
+        if not any(vals):
+            return
+        W, H, pad = 640, 190, 30
+        S = 2
+        img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        acc = G.hex_rgb(G.ACCENT)
+        bar_w = (W - pad * 2) / 14
+        peak = max(vals)
+        for i, (day, v) in enumerate(zip(days, vals)):
+            h = int((H - pad * 2) * (v / peak) * S) if peak else 0
+            x = int((pad + i * bar_w + bar_w * 0.15) * S)
+            bw = int(bar_w * 0.7 * S)
+            y_base = (H - pad) * S
+            d.rounded_rectangle((x, y_base - h, x + bw, y_base), radius=4 * S,
+                                fill=acc + (255,) if v else (120, 120, 130, 90))
+            if i % 2 == 0 or v:
+                lbl = day.strftime("%d.%m")
+                f = visuals.pil_font(11 * S)
+                tw = d.textbbox((0, 0), lbl, font=f)
+                d.text((x + bw / 2 - (tw[2] - tw[0]) / 2, y_base + 6 * S), lbl, font=f,
+                       fill=(140, 140, 150, 255))
+        img = img.resize((W, H), Image.Resampling.LANCZOS)
+        card = self.app._card(self.body)
+        card.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 14))
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(card, text="Время в игре — последние 14 дней", font=G.font(14, "bold"),
+                     text_color=G.TEXT, anchor="w").grid(row=0, column=0, sticky="w",
+                                                          padx=18, pady=(14, 4))
+        self._chart_img = G.ctkimg(img, (W, H))
+        ctk.CTkLabel(card, text="", image=self._chart_img).grid(row=1, column=0, sticky="ew",
+                                                                 padx=18, pady=(0, 14))
 
     def _section(self, title, data, row):
         card = self.app._card(self.body)
