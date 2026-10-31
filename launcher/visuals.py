@@ -2,6 +2,7 @@
 Картинки делаются в 2x-разрешении, чтобы быть чёткими на HiDPI-экранах."""
 import colorsys
 import hashlib
+import math
 import random
 from io import BytesIO
 
@@ -243,6 +244,19 @@ def nav_icon(kind, color, size=20):
         for y in (14, 52):
             d.rounded_rectangle((12, y, 84, y + 30), 9, outline=c, width=7)
             d.ellipse((24, y + 9, 34, y + 19), fill=c)
+    elif kind == "worlds":  # глобус
+        d.ellipse((14, 14, 82, 82), outline=c, width=7)
+        d.ellipse((34, 14, 62, 82), outline=c, width=5)
+        d.line([(14, 48), (82, 48)], fill=c, width=5)
+    elif kind == "shop":  # пакет с покупками
+        d.line([(30, 26), (30, 20), (38, 12), (58, 12), (66, 20), (66, 26)], fill=c, width=6, joint="curve")
+        d.rounded_rectangle((18, 26, 78, 82), 10, outline=c, width=7)
+    elif kind == "char":  # человек
+        d.ellipse((36, 12, 60, 36), outline=c, width=7)
+        d.line([(48, 36), (48, 58)], fill=c, width=7)
+        d.line([(26, 48), (48, 44), (70, 48)], fill=c, width=7, joint="curve")
+        d.line([(48, 58), (34, 82)], fill=c, width=7)
+        d.line([(48, 58), (62, 82)], fill=c, width=7)
     elif kind == "shots":
         d.rounded_rectangle((10, 18, 86, 78), 12, outline=c, width=7)
         d.ellipse((24, 30, 38, 44), fill=c)
@@ -317,3 +331,50 @@ def skin_face(path, size=40):
     hat = im.crop((40 * k, 8 * k, 48 * k, 16 * k))
     face = Image.alpha_composite(face, hat)
     return round_corners(face.resize((size * S, size * S), RS.NEAREST), 10 * S)
+
+
+def lobby_backdrop(w, h, character=None, accent="#4ade80"):
+    """Фон лобби в стиле современных лаунчеров: лучи из центра, блёстки,
+    посередине — персонаж (RGBA или None). Возвращает RGBA."""
+    W, H = max(w, 64), max(h, 64)
+    bg = Image.new("RGBA", (W, H), (11, 13, 19, 255))
+    d = ImageDraw.Draw(bg, "RGBA")
+    cx, cy = W // 2, int(H * 0.44)
+    acc = hex_rgb(accent)
+    # расходящиеся лучи
+    n = 18
+    far = int(math.hypot(W, H))
+    for i in range(n):
+        ang = i / n * math.tau
+        spread = math.tau / n * 0.30
+        far = int(math.hypot(W, H))
+        alpha = 14 if i % 2 else 22
+        pts = [(cx, cy),
+               (cx + math.cos(ang - spread) * far, cy + math.sin(ang - spread) * far),
+               (cx + math.cos(ang + spread) * far, cy + math.sin(ang + spread) * far)]
+        d.polygon(pts, fill=(255, 255, 255, alpha))
+    # мягкое свечение за персонажем
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse((cx - W // 4, cy - W // 4, cx + W // 4, cy + W // 4),
+                                 fill=acc + (36,))
+    bg = Image.alpha_composite(bg, glow.filter(ImageFilter.GaussianBlur(60)))
+    d = ImageDraw.Draw(bg, "RGBA")
+    # блёстки
+    rnd = random.Random(42)
+    for _ in range(max(30, W * H // 9000)):
+        x, y = rnd.randrange(W), rnd.randrange(H)
+        s = rnd.choice((2 * S, 3 * S, 4 * S))
+        col = (255, 255, 255) if rnd.random() < 0.7 else acc
+        d.rectangle((x, y, x + s, y + s), fill=col + (rnd.randrange(40, 140),))
+    if character is not None:
+        ch = character
+        target_h = int(H * 0.86)
+        tw = int(ch.width * target_h / ch.height)
+        ch = ch.resize((tw, target_h), RS.LANCZOS)
+        shadow = Image.new("RGBA", (tw * 2, target_h // 5), (0, 0, 0, 0))
+        ImageDraw.Draw(shadow).ellipse((tw // 3, 0, tw + tw // 3, target_h // 5), fill=(0, 0, 0, 90))
+        bg.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(8)), (cx - tw, int(H * 0.95)))
+        bg.alpha_composite(ch, (cx - tw // 2, int(H * 0.97) - target_h))
+    return round_corners(bg, 22 * S)
+
+

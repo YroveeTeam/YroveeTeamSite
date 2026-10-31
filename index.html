@@ -134,7 +134,10 @@
                  || assets.find(a => a.name.endsWith(".zip"));
       if (asset) ["navDl", "heroDl"].forEach(i => $(i).href = asset.browser_download_url);
       const v = (rel.tag_name || "").replace(/^v/, "");
-      if (v && parseFloat(v) > parseFloat(S.version)) $("heroVer").textContent = "v" + v;
+      const nums = s => s.split(".").map(Number);
+      const newer = (a, b) => { const x = nums(a), y = nums(b);
+        return x[0] !== y[0] ? x[0] > y[0] : (x[1] || 0) > (y[1] || 0); };
+      if (v && newer(v, S.version)) $("heroVer").textContent = "v" + v;
     } catch (e) { /* нет сети/лимит GitHub — ссылка из data.js остаётся */ }
   })();
 

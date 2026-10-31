@@ -24,7 +24,7 @@ BACKUPS_DIR = DATA / "backups"  # бэкапы миров по инстанса�
 CONFIG_FILE = DATA / "config.json"
 
 LAUNCHER_NAME = "YroveeLauncher"
-LAUNCHER_VERSION = "0.9"
+LAUNCHER_VERSION = "0.11"
 
 # Клиентское приложение Azure для входа через Microsoft.
 # Создай бесплатно на portal.azure.com (App registrations → Accounts in any
@@ -50,6 +50,21 @@ DEFAULT_CONFIG = {
     "stats": {"launches": 0, "by_version": {}, "by_account": {}},
     "backup_on_launch": False,
     "discord_app_id": "",  # Application ID из Discord Developer Portal для Rich Presence
+    "close_on_launch": False,   # закрывать лаунчер, когда игра запустилась
+    "minimize_to_tray": False,  # крестик сворачивает в трей вместо выхода
+    "auto_update_mods": False,  # молча проверять обновления модов при запуске
+    "whatsnew_seen": "",        # какая версия уже показывала окно «Что нового»
+    # --- косметика и кристаллы (всё бесплатно, без доната) ---
+    "crystals": 50,             # стартовый баланс
+    "cosmetics": {"owned": [], "equipped": {}},
+    "promo_used": [],           # использованные промокоды из TG-канала
+    "last_daily": "",           # последний ежедневный бонус
+    "playtime_hours": 0,        # всего часов в игре (уровень, задания)
+    "drop_hours": 0,            # сколько часов уже учтено часовыми дропами
+    "quests": {},               # прогресс заданий (launches/mods/builds/chests)
+    "quests_claimed": [],
+    "daily_play": {},           # время игры за сегодня (сундуки за игру)
+    "daily_chests": {},         # сколько сундуков за игру забрано сегодня
 }
 
 

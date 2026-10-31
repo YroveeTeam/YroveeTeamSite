@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import queue
 import re
@@ -20,21 +21,23 @@ from PIL import Image, ImageTk
 
 import visuals
 import auth
+import cosmetics as cos
 import rpc
 import updater
+from shop_pages import CharacterPage, ShopPage, show_drop_dialog
 from auth import ensure_msa_token
 from builds import install_modpack, install_pack_zip
-from config import (BACKUPS_DIR, MSA_CLIENT_ID, REPO, SITE_URL, CACHE_DIR, INSTANCES_DIR,
-                    LAUNCHER_NAME, LAUNCHER_VERSION, SKINS_DIR, instance_dir, load_config,
-                    save_config)
+from config import (BACKUPS_DIR, MSA_CLIENT_ID, NATIVES_DIR, REPO, SITE_URL, CACHE_DIR,
+                    INSTANCES_DIR, LAUNCHER_NAME, LAUNCHER_VERSION, SKINS_DIR,
+                    instance_dir, load_config, save_config)
 from export_pack import detect_loader_version, export_modpack
 from fabric import fabric_id, install_fabric
-from forge import ensure_forge
+from forge import ensure_forge, find_forge_id
 from gamelog import LogWriter, crash_hint
 from maintenance import backup_saves, import_from_official, restore_backup
-from neoforge import ensure_neoforge
+from neoforge import ensure_neoforge, find_neoforge_id
 from pages_extra import (BuildsPage, LogPage, ScreenshotsPage, ServersPage,
-                         StatsPage)
+                         StatsPage, WorldsPage)
 from quilt import install_quilt, quilt_id
 from java_installer import ensure_java
 from launcher import launch, required_java
@@ -42,7 +45,8 @@ from modrinth import (KIND_DIRS, analyze, fill_missing_icons, install_mod,
                       list_installed, remove_mod, search_mods)
 from net import friendly_error, get_bytes
 from optimize import OPT_MODS, PRESETS, preset_args, recommended_ram
-from versions import get_all_versions, install_version, installed_versions
+from versions import (extract_natives, get_all_versions_cached, install_version,
+                      installed_versions, load_version)
 
 # ---------- палитра ----------
 BG = "#0b0d13"
@@ -66,7 +70,8 @@ FONT = "Segoe UI"
 SKIN_MOD_ID = "idMHQ4n2"  # CustomSkinLoader на Modrinth
 NICK_RE = r"[A-Za-z0-9_]{3,16}"
 OLDEST_VERSION = "1.5.2"  # самая старая версия в списке
-BANNER_H = 160
+BANNER_H = 160  # устаревшее имя; лобби использует LOBBY_H
+LOBBY_H = 400   # высота фона лобби с персонажем
 PLAY_H = 58
 ICON = 52  # размер иконки мода
 LOADERS = {"fabric", "forge", "quilt", "neoforge", "liteloader", "rift", "modloader"}
@@ -148,6 +153,63 @@ def open_folder(path):
         subprocess.Popen(["open", str(path)])
     else:
         subprocess.Popen(["xdg-open", str(path)])
+
+
+def parse_site_data(text):
+    """data.js сайта -> словарь SITE (достаточно строгий парсер для нашего формата)."""
+    body = re.sub(r"(?m)^\s*//.*$", "", text)  # комментарии-строки
+    # ключи вида `v:` после { [ или , — в кавычки (JSON-подобный формат сайта)
+    body = re.sub(r"([{\[,]\s*)([A-Za-z_]\w*)\s*:", r'\1"\2":', body)
+    start, end = body.find("{"), body.rfind("}")
+    return json.loads(body[start:end + 1])
+
+
+# ======================================================================
+#  Окно «Что нового» — показывается после обновления лаунчера
+# ======================================================================
+class WhatsNewDialog(ctk.CTkToplevel):
+    def __init__(self, master, entry):
+        super().__init__(master)
+        v, date, items = entry.get("v", ""), entry.get("date", ""), entry.get("items", [])
+        self.title(f"Что нового — v{v}")
+        self.geometry("480x460")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        self.grab_set()
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        head = f"YroveeLauncher v{v}"
+        if date:
+            head += f"  ·  {date}"
+        ctk.CTkLabel(self, text="🎉 Что нового", font=font(24, "bold"),
+                     text_color=TEXT).grid(row=0, column=0, sticky="w", padx=24, pady=(22, 2))
+        ctk.CTkLabel(self, text=head, font=font(13), text_color=ACCENT,
+                     anchor="w").grid(row=1, column=0, sticky="w", padx=24, pady=(0, 12))
+        box = ctk.CTkScrollableFrame(self, fg_color="transparent",
+                                     scrollbar_button_color=BORDER,
+                                     scrollbar_button_hover_color=MUTED)
+        box.grid(row=2, column=0, sticky="nsew", padx=16)
+        box.grid_columnconfigure(0, weight=1)
+        for it in items:
+            row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=12, border_width=1,
+                               border_color=BORDER)
+            row.grid(sticky="ew", padx=6, pady=4)
+            ctk.CTkLabel(row, text="•  " + it, font=font(13), text_color=TEXT, anchor="w",
+                         justify="left", wraplength=390).pack(anchor="w", padx=14, pady=10)
+        ctk.CTkButton(self, text="Понятно", height=42, corner_radius=12, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT, font=font(14, "bold"),
+                      command=self.destroy).grid(row=3, column=0, sticky="ew", padx=24, pady=14)
+        self.after(250, self._focus)
+
+    def _focus(self):
+        try:
+            self.lift()
+            self.focus_force()
+            self.grab_set()
+        except Exception:
+            pass
 
 
 # ======================================================================
@@ -569,6 +631,10 @@ class App(ctk.CTk):
         self.mod_queued = set()  # pid'ы в очереди — чтобы помечать кнопки
         self.current_page = None
         self.available_version = ""  # новая версия лаунчера, если нашли
+        self._tray = None
+        self._quitting = False
+        self._search_job = None
+        self._last_search = None
         self.all_versions = []
         self.mod_hits = []
         self.mod_hits_key = None
@@ -609,9 +675,12 @@ class App(ctk.CTk):
 
         self.pages = {
             "play": self._build_play(),
+            "shop": ShopPage(self),
+            "char": CharacterPage(self),
             "mods": self._build_mods(),
             "builds": BuildsPage(self),
             "servers": ServersPage(self),
+            "worlds": WorldsPage(self),
             "shots": ScreenshotsPage(self),
             "log": LogPage(self),
             "stats": StatsPage(self),
@@ -626,6 +695,8 @@ class App(ctk.CTk):
         self.after(400, self._set_window_icon)
         threading.Thread(target=self._load_versions, daemon=True).start()
         threading.Thread(target=self._check_update, daemon=True).start()
+        if self.cfg.get("minimize_to_tray"):
+            self._make_tray()
         # .mrpack, переданный лаунчеру (двойной клик по файлу)
         packs = [a for a in sys.argv[1:] if a.lower().endswith(".mrpack")]
         if packs:
@@ -709,9 +780,10 @@ class App(ctk.CTk):
 
         self.nav = {}
         self.nav_icons = {}
-        items = [("play", "Играть"), ("mods", "Моды и паки"), ("builds", "Сборки"),
-                 ("servers", "Серверы"), ("shots", "Скриншоты"), ("log", "Лог игры"),
-                 ("stats", "Статистика"), ("settings", "Настройки")]
+        items = [("play", "Играть"), ("shop", "Магазин"), ("char", "Персонаж"),
+                 ("mods", "Моды и паки"), ("builds", "Сборки"),
+                 ("servers", "Серверы"), ("worlds", "Миры"), ("shots", "Скриншоты"),
+                 ("log", "Лог игры"), ("stats", "Статистика"), ("settings", "Настройки")]
         for i, (key, text) in enumerate(items, start=1):
             off = ctkimg(visuals.nav_icon(key, MUTED), (20, 20))
             on = ctkimg(visuals.nav_icon(key, ACCENT), (20, 20))
@@ -739,8 +811,9 @@ class App(ctk.CTk):
         self.side_name = ctk.CTkLabel(prof, text="", font=font(14, "bold"),
                                       text_color=TEXT, anchor="w", cursor="hand2")
         self.side_name.grid(row=0, column=1, sticky="sw", pady=(12, 0))
-        sub = ctk.CTkLabel(prof, text=f"Оффлайн · v{LAUNCHER_VERSION}", font=font(11),
+        sub = ctk.CTkLabel(prof, text=f"💎 {cos.balance(self.cfg)}  ·  v{LAUNCHER_VERSION}", font=font(11),
                            text_color=MUTED, anchor="w", cursor="hand2")
+        self.side_sub = sub
         sub.grid(row=1, column=1, sticky="nw", pady=(0, 12))
         chev = ctk.CTkLabel(prof, text="⇅", font=font(15), text_color=MUTED, cursor="hand2")
         chev.grid(row=0, column=2, rowspan=2, padx=(0, 14))
@@ -893,21 +966,35 @@ class App(ctk.CTk):
         elif hasattr(page, "on_show"):
             page.on_show()
 
-    # ================== страница «Играть» ==================
+    # ================== страница «Играть» (лобби) ==================
     def _build_play(self):
         page = ctk.CTkFrame(self.content, fg_color="transparent")
         page.grid_columnconfigure(0, weight=1)
-        page.grid_rowconfigure(3, weight=1)
+        page.grid_rowconfigure(4, weight=1)
 
-        self.banner_lbl = ctk.CTkLabel(page, text="", height=BANNER_H)
+        self.banner_lbl = ctk.CTkLabel(page, text="", height=LOBBY_H)
         self.banner_lbl.grid(row=0, column=0, sticky="ew")
         self._set_banner(700)
         page.bind("<Configure>", self._on_play_page_configure)
 
+        # быстрые переходы в стиле современных лаунчеров
+        quick = ctk.CTkFrame(page, fg_color="transparent")
+        quick.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        quick.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="quick")
+        for col, (key, label, color, hover) in enumerate((
+                ("shop", "🎁  Магазин", "#7c3aed", "#8b5cf6"),
+                ("char", "👤  Персонаж", "#0284c7", "#0ea5e9"),
+                ("builds", "🧱  Сборки", "#b45309", "#f59e0b"),
+                ("servers", "🌐  Серверы", "#059669", "#10b981"))):
+            ctk.CTkButton(quick, text=label, height=56, corner_radius=14,
+                          fg_color=color, hover_color=hover, text_color="#ffffff",
+                          font=font(15, "bold"), command=lambda k=key: self.show_page(k)
+                          ).grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 10, 0))
+
         card = self._card(page)
-        card.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        card.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=22, pady=20)
+        inner.pack(fill="x", padx=22, pady=16)
         inner.grid_columnconfigure(0, weight=1)
         inner.grid_columnconfigure(1, weight=1)
 
@@ -934,15 +1021,15 @@ class App(ctk.CTk):
         self.loader.grid(row=1, column=2, sticky="e", padx=(14, 0))
 
         tiles = ctk.CTkFrame(page, fg_color="transparent")
-        tiles.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        tiles.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         tiles.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="tile")
         self.tile_ram = self._tile(tiles, "Память", 0)
         self.tile_loader = self._tile(tiles, "Загрузчик", 1)
         self.tile_mods = self._tile(tiles, "Модов", 2)
-        self.tile_build = self._tile(tiles, "Сборка", 3)
+        self.tile_crystals = self._tile_btn(tiles, "Кристаллы", 3, lambda: self.show_page("shop"))
 
         bottom = ctk.CTkFrame(page, fg_color="transparent")
-        bottom.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        bottom.grid(row=5, column=0, sticky="ew", pady=(14, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
         self.status = ctk.CTkLabel(bottom, text="", font=font(13), text_color=MUTED,
@@ -961,7 +1048,67 @@ class App(ctk.CTk):
             font=font(19, "bold"), command=self.on_play,
         )
         self.play_btn.grid(row=2, column=0, sticky="ew")
+
+        self.chest_btn = ctk.CTkButton(
+            bottom, text="🎁 Сундук за игру", height=PLAY_H, corner_radius=16,
+            fg_color=FIELD, hover_color=FIELD, text_color=MUTED, text_color_disabled=MUTED,
+            font=font(15, "bold"), command=self.claim_chest, state="disabled",
+        )
+        self.chest_btn.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self._refresh_chest_btn()
         return page
+
+    def _tile_btn(self, parent, caption, col, command):
+        """Плитка-кнопка (для кристаллов: клик открывает магазин)."""
+        f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1,
+                         border_color=BORDER, cursor="hand2")
+        f.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 12, 0))
+        ctk.CTkLabel(f, text=caption, font=font(12), text_color=MUTED, anchor="w").grid(
+            row=0, column=0, sticky="w", padx=18, pady=(14, 0))
+        value = ctk.CTkLabel(f, text="", font=font(18, "bold"), text_color=ACCENT, anchor="w")
+        value.grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+        for w in (f, value):
+            w.bind("<Button-1>", lambda e: command())
+        return value
+
+    def _refresh_chest_btn(self):
+        if not hasattr(self, "chest_btn"):
+            return
+        ready, total, need = cos.playtime_chest_state(self.cfg)
+        if ready > 0:
+            self.chest_btn.configure(
+                text=f"🎁 Забрать сундук{'ы' if ready > 1 else ''} ({ready})",
+                state="normal", fg_color="#f59e0b", hover_color="#d97706",
+                text_color="#231400", text_color_disabled=MUTED)
+        else:
+            self.chest_btn.configure(text=f"🎁 Сундук через {cos.fmt_wait(need)} игры",
+                                     state="disabled", fg_color=FIELD, hover_color=FIELD,
+                                     text_color=MUTED, text_color_disabled=MUTED)
+
+    def claim_chest(self):
+        events, err = cos.claim_playtime_chest(self.cfg)
+        if err:
+            return self._set_status(err, ERROR)
+        save_config(self.cfg)
+        self._refresh_lobby()
+        show_drop_dialog(self, events, "Сундук за игру")
+
+    def _refresh_lobby(self):
+        """Обновляет всё, что зависит от кристаллов и косметики."""
+        self._refresh_banner()
+        self._refresh_chest_btn()
+        self._refresh_tiles()
+        if hasattr(self, "side_sub"):
+            self.side_sub.configure(text=f"💎 {cos.balance(self.cfg)}  ·  v{LAUNCHER_VERSION}")
+
+    def _lobby_character(self):
+        try:
+            acc = self.account()
+            path = SKINS_DIR / acc["skin"] if acc.get("skin") else None
+            skin = path.read_bytes() if path and path.exists() else None
+            return cos.render_character(skin, cos.equipped(self.cfg), view="front", scale=6)
+        except Exception:
+            return None
 
     def _tile(self, parent, caption, col):
         f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
@@ -979,17 +1126,14 @@ class App(ctk.CTk):
         if self.cfg["loader"] != "Vanilla" and self.cfg["last_version"]:
             count = str(len(list_installed(self._game_dir() / "mods")))
         self.tile_mods.configure(text=count)
-        b = self._build()
-        self.tile_build.configure(text=(b["name"][:14] + "…" if len(b["name"]) > 15 else b["name"]) if b else "—")
+        self.tile_crystals.configure(text=f"{cos.balance(self.cfg)} 💎")
 
-    # --- баннер и кнопка подстраиваются под ширину окна ---
+    # --- фон лобби: лучи, блёстки и твой персонаж с косметикой ---
     def _set_banner(self, w):
         self.banner_w = w
-        v = self.cfg["last_version"]
-        sub = f"Minecraft {v} · {self.cfg['loader']}" if v else "Выбери версию и нажми «Играть»"
-        pil = visuals.banner(w, BANNER_H, "Minecraft launcher", LAUNCHER_NAME, sub,
-                             palette=visuals.palette_for(v), accent=ACCENT)
-        self._banner_img = ctkimg(pil, (w, BANNER_H))
+        pil = visuals.lobby_backdrop(w, LOBBY_H, character=self._lobby_character(),
+                                     accent=ACCENT)
+        self._banner_img = ctkimg(pil, (w, LOBBY_H))
         self.banner_lbl.configure(image=self._banner_img)
 
     def _refresh_banner(self):
@@ -1097,7 +1241,8 @@ class App(ctk.CTk):
         bar.grid_columnconfigure(0, weight=1)
         self.mod_query = self._entry(bar, "Поиск на Modrinth")
         self.mod_query.grid(row=0, column=0, sticky="ew")
-        self.mod_query.bind("<Return>", lambda e: self.mods_search())
+        self.mod_query.bind("<Return>", lambda e: self.mods_search(force=True))
+        self.mod_query.bind("<KeyRelease>", self._on_query_key)
         ctk.CTkButton(
             bar, text="Найти", width=96, height=42, corner_radius=12,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
@@ -1193,19 +1338,42 @@ class App(ctk.CTk):
         color = ERROR if error else (ACCENT if text.startswith("Установлено") else MUTED)
         self.mod_status.configure(text=text, text_color=color)
 
-    def mods_search(self):
+    def _search_key(self):
+        """Ключ результата поиска: версия, тип, загрузчик, категории и сам запрос."""
+        return (self.cfg["last_version"], self._kind(), self._loader_key(),
+                tuple(self._cats()), self.mod_query.get().strip())
+
+    def _on_query_key(self, event):
+        if event.keysym in ("Return", "Escape", "Up", "Down", "Left", "Right", "Home", "End"):
+            return
+        if self._search_job:
+            self.after_cancel(self._search_job)
+        self._search_job = self.after(700, self._live_search)
+
+    def _live_search(self):
+        self._search_job = None
+        if self._kind_ready():
+            return
+        if self.mod_query.get().strip() != self._last_search:
+            self.mods_search()
+
+    def mods_search(self, force=False):
         if self._kind_ready():
             self._render_mods()
             return
-        key = self._mods_key()
+        key = self._search_key()
+        if not force and self.mod_hits_key == key:
+            self._render_mods()
+            return
+        self._last_search = key[4]
         self.mod_loading = True
         self._set_mod_status("Поиск…")
         self._render_mods()
-        threading.Thread(target=self._search_worker, args=(self.mod_query.get().strip(), key),
+        threading.Thread(target=self._search_worker, args=(key[4], key),
                          daemon=True).start()
 
     def _search_worker(self, query, key):
-        version, kind, loader, cats = key
+        version, kind, loader, cats, _q = key
         try:
             hits = search_mods(query, version, loader, kind=kind, categories=cats)
             self.q.put(("mods_hits", hits, key))
@@ -1575,6 +1743,8 @@ class App(ctk.CTk):
             install_mod(pid, version, self._loader_key(), dest,
                         status=lambda t: q.put(("mods_status", t, False)), kind=kind)
             q.put(("mods_status", f"Установлено: {title}", False))
+            cos.bump_counter(self.cfg, "mods")
+            save_config(self.cfg)
         except Exception as e:
             traceback.print_exc()
             q.put(("mods_status", f"Ошибка: {e}", True))
@@ -1707,11 +1877,18 @@ class App(ctk.CTk):
         card.grid_columnconfigure(0, weight=1)
         self._caption(card, "Файлы игры: сохранения, моды, options.txt").grid(
             row=0, column=0, sticky="w", padx=24, pady=(22, 10))
+        frow = ctk.CTkFrame(card, fg_color="transparent")
+        frow.grid(row=1, column=0, sticky="w", padx=24, pady=(0, 22))
         ctk.CTkButton(
-            card, text="Открыть папку игры", height=40, corner_radius=12, border_width=1,
+            frow, text="Открыть папку игры", height=40, corner_radius=12, border_width=1,
             fg_color="transparent", hover_color=HOVER, border_color=BORDER,
             text_color=TEXT, font=font(13), command=self.open_game_folder,
-        ).grid(row=1, column=0, sticky="w", padx=24, pady=(0, 22))
+        ).pack(side="left")
+        ctk.CTkButton(
+            frow, text="Починить файлы игры", height=40, corner_radius=12, border_width=1,
+            fg_color="transparent", hover_color=HOVER, border_color=BORDER,
+            text_color=TEXT, font=font(13), command=self.repair_files,
+        ).pack(side="left", padx=(10, 0))
 
         # --- обслуживание: бэкапы и перенос ---
         card = self._card(scroll)
@@ -1734,27 +1911,44 @@ class App(ctk.CTk):
                           fg_color=FIELD, hover_color=HOVER, border_color=BORDER,
                           text_color=TEXT, font=font(13), command=cmd).pack(side="left", padx=(0, 10))
 
-        self._caption(card, "Рендер графики (эксперимент)").grid(
+        self._caption(card, "Рендер графики").grid(
             row=3, column=0, sticky="w", padx=24, pady=(18, 6))
-        self.vulkan_btn = ctk.CTkButton(
-            card, text="…", height=38, corner_radius=12, font=font(13, "bold"),
-            command=self.vulkan_click)
-        self.vulkan_btn.grid(row=4, column=0, sticky="w", padx=24)
+        self.vulkan_switch = ctk.CTkSwitch(
+            card, text="Включить Vulkan (мод VulkanMod вместо OpenGL)",
+            command=self.vulkan_toggle, font=font(13), text_color=TEXT,
+            progress_color=ACCENT, button_color=FIELD, button_hover_color=HOVER)
+        self.vulkan_switch.grid(row=4, column=0, sticky="w", padx=24)
         self.vulkan_note = ctk.CTkLabel(
             card, font=font(12), text_color=MUTED, anchor="w", justify="left", wraplength=620,
-            text="OpenGL — обычный рендер Minecraft. Vulkan (мод VulkanMod) на некоторых ПК даёт "
-                 "заметно больше FPS, но несовместим с шейдерами Iris и бывает нестабилен.")
+            text="Vulkan на некоторых ПК даёт заметно больше FPS, чем обычный OpenGL, но "
+                 "несовместим с шейдерами Iris и бывает нестабилен. Работает на Fabric.")
         self.vulkan_note.grid(row=5, column=0, sticky="w", padx=24, pady=(8, 22))
         self._refresh_vulkan()
 
-        # --- прочее ---
+        # --- поведение и прочее ---
         card = self._card(scroll)
         card.grid(row=5, column=0, sticky="ew", padx=(0, 8))
         card.grid_columnconfigure(0, weight=1)
+        self._caption(card, "Поведение").grid(
+            row=0, column=0, sticky="w", padx=24, pady=(22, 10))
+        self.close_var = ctk.BooleanVar(value=bool(self.cfg.get("close_on_launch")))
+        self.tray_var = ctk.BooleanVar(value=bool(self.cfg.get("minimize_to_tray")))
+        self.autoupd_var = ctk.BooleanVar(value=bool(self.cfg.get("auto_update_mods")))
+        for r, (var, text) in enumerate((
+                (self.close_var, "Закрывать лаунчер, когда игра запустилась"),
+                (self.tray_var, "Крестик сворачивает в трей (иконка возле часов)"),
+                (self.autoupd_var, "Проверять обновления модов при запуске игры")),
+                start=1):
+            ctk.CTkCheckBox(
+                card, text=text, variable=var, font=font(13), text_color=TEXT,
+                fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER,
+                corner_radius=6,
+            ).grid(row=r, column=0, sticky="w", padx=24, pady=3)
+
         self._caption(card, "Discord Rich Presence (необязательно)").grid(
-            row=0, column=0, sticky="w", padx=24, pady=(22, 6))
+            row=4, column=0, sticky="w", padx=24, pady=(18, 6))
         drow = ctk.CTkFrame(card, fg_color="transparent")
-        drow.grid(row=1, column=0, sticky="ew", padx=24)
+        drow.grid(row=5, column=0, sticky="ew", padx=24)
         drow.grid_columnconfigure(0, weight=1)
         self.discord_entry = self._entry(drow, "Application ID из discord.com/developers")
         self.discord_entry.insert(0, self.cfg.get("discord_app_id", ""))
@@ -1762,18 +1956,23 @@ class App(ctk.CTk):
         ctk.CTkLabel(card, text="Пока ты играешь, в Discord показывается «играет в Minecraft <версия>». "
                                 "Application ID создаётся бесплатно на discord.com/developers → Applications.",
                      font=font(12), text_color=MUTED, anchor="w", justify="left",
-                     wraplength=620).grid(row=2, column=0, sticky="w", padx=24, pady=(8, 0))
+                     wraplength=620).grid(row=6, column=0, sticky="w", padx=24, pady=(8, 0))
 
         self._caption(card, "Обновление лаунчера").grid(
-            row=3, column=0, sticky="w", padx=24, pady=(18, 6))
+            row=7, column=0, sticky="w", padx=24, pady=(18, 6))
         self.update_btn = ctk.CTkButton(
             card, text="Обновить лаунчер до последней версии", height=38, corner_radius=12,
             fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=ACCENT_TEXT,
             font=font(13, "bold"), command=self.self_update_click)
-        self.update_btn.grid(row=4, column=0, sticky="w", padx=24, pady=(0, 6))
+        self.update_btn.grid(row=8, column=0, sticky="w", padx=24, pady=(0, 6))
         self.update_note = ctk.CTkLabel(card, text="", font=font(12), text_color=MUTED,
                                         anchor="w", justify="left", wraplength=620)
-        self.update_note.grid(row=5, column=0, sticky="w", padx=24, pady=(0, 18))
+        self.update_note.grid(row=9, column=0, sticky="w", padx=24, pady=(0, 6))
+        ctk.CTkButton(
+            card, text="Сообщить о баге (создать вопрос на GitHub)", height=34, corner_radius=12,
+            border_width=1, fg_color="transparent", hover_color=HOVER, border_color=BORDER,
+            text_color=MUTED, font=font(12), command=self.report_bug,
+        ).grid(row=10, column=0, sticky="w", padx=24, pady=(0, 18))
         self.after(3000, self._refresh_update_note)
         return page
 
@@ -1825,24 +2024,23 @@ class App(ctk.CTk):
         return None
 
     def _refresh_vulkan(self):
-        if not hasattr(self, "vulkan_btn"):
+        if not hasattr(self, "vulkan_switch"):
             return
         if self.cfg["loader"] != "Fabric":
-            self.vulkan_btn.configure(
-                text="Vulkan доступен на Fabric", fg_color=FIELD, hover_color=FIELD,
-                border_width=1, border_color=BORDER, text_color=MUTED, state="disabled")
+            self.vulkan_switch.configure(state="disabled",
+                                         text="Vulkan доступен только на Fabric")
+            self.vulkan_switch.deselect()
             return
+        self.vulkan_switch.configure(state="normal",
+                                     text="Включить Vulkan (мод VulkanMod вместо OpenGL)")
         if self._vulkan_pid():
-            self.vulkan_btn.configure(text="✓ Vulkan (VulkanMod) включён — выключить",
-                                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                                      border_width=0, text_color=ACCENT_TEXT, state="normal")
+            self.vulkan_switch.select()
         else:
-            self.vulkan_btn.configure(text="Включить рендер Vulkan (мод VulkanMod)",
-                                      fg_color=FIELD, hover_color=HOVER, border_width=1,
-                                      border_color=BORDER, text_color=TEXT, state="normal")
+            self.vulkan_switch.deselect()
 
-    def vulkan_click(self):
+    def vulkan_toggle(self):
         if self.cfg["loader"] != "Fabric" or not self.cfg["last_version"]:
+            self._refresh_vulkan()
             self._set_status("VulkanMod работает на Fabric — переключи загрузчик на странице «Играть»", ERROR)
             return
         pid = self._vulkan_pid()
@@ -1852,8 +2050,69 @@ class App(ctk.CTk):
         else:
             self._enqueue_mod("vulkanmod", "VulkanMod", self.cfg["last_version"],
                               self._game_dir() / "mods", "mod")
-            self._set_status("Установка VulkanMod — после неё игра будет рендериться через Vulkan")
-        self._refresh_vulkan()
+            self._set_status("Устанавливаю VulkanMod… после установки игра будет рендерить через Vulkan")
+        self.after(2000, self._refresh_vulkan)
+
+    # --- починка файлов игры ---
+    def repair_files(self):
+        if not self.cfg["last_version"]:
+            self._set_status("Сначала выбери версию на странице «Играть»", ERROR)
+            return
+        self._set_status("Проверяю файлы игры (это может занять пару минут)…")
+        b = self._build()
+        threading.Thread(target=self._repair_worker,
+                         args=(self.cfg["last_version"], self.cfg["loader"],
+                               b.get("forge_version", "") if b else ""),
+                         daemon=True).start()
+
+    def _repair_worker(self, version, loader, forge_version):
+        q = self.q
+        try:
+            launch_id = version
+            if loader == "Fabric":
+                launch_id = fabric_id(version)
+            elif loader == "Quilt":
+                launch_id = quilt_id(version)
+            elif loader == "Forge":
+                launch_id = find_forge_id(version, forge_version or None) or version
+            elif loader == "NeoForge":
+                launch_id = find_neoforge_id(version) or version
+
+            def progress(done, total):
+                q.put(("progress", done / total if total else 1,
+                       f"Проверка файлов: {done} / {total}"))
+
+            install_version(launch_id, progress)  # битые и отсутствующие файлы перекачаются
+            data = load_version(launch_id)
+            shutil.rmtree(NATIVES_DIR / data["id"], ignore_errors=True)
+            extract_natives(data)
+            q.put(("progress_reset",))
+            q.put(("status", "Файлы игры проверены, повреждённые перекачаны"))
+        except Exception as e:
+            q.put(("progress_reset",))
+            q.put(("status", f"Не удалось проверить файлы: {friendly_error(e)}", True))
+
+    def report_bug(self):
+        webbrowser.open(f"https://github.com/{REPO}/issues/new")
+
+    def _auto_mod_check(self, cfg):
+        """Молча проверяет обновления модов, пока игра запускается."""
+        try:
+            if cfg.get("loader") == "Vanilla":
+                return
+            dest = Path(cfg["game_dir"]) / "mods"
+            if not list_installed(dest):
+                return
+            loader = {"Fabric": "fabric", "Forge": "forge", "Quilt": "quilt",
+                      "NeoForge": "neoforge"}.get(cfg.get("loader"), "")
+            res = analyze(dest, cfg["last_version"], loader, "mod")
+            if res["updates"]:
+                res["key"] = (str(dest), cfg["last_version"], "mod", loader, ())
+                self.q.put(("mods_analysis", res))
+                self.q.put(("status", f"Моды: доступно обновлений: {len(res['updates'])} "
+                                      f"— страница «Моды → Установленные»"))
+        except Exception:
+            pass  # проверка фоновая: нет сети — не страшно
 
     def _on_preset(self, name):
         self.perf_desc.configure(text=PRESETS[name][0])
@@ -1873,7 +2132,7 @@ class App(ctk.CTk):
         self.save_all()
         args = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable] + sys.argv
         subprocess.Popen(args)
-        self.on_close()
+        self._really_close()
 
     def _on_ram(self, value):
         self.ram_label.configure(text=f"{value / 1024:.1f} ГБ")
@@ -1903,25 +2162,74 @@ class App(ctk.CTk):
         c["perf_preset"] = self.perf_seg.get()
         if hasattr(self, "backup_var"):
             c["backup_on_launch"] = bool(self.backup_var.get())
+        if hasattr(self, "close_var"):
+            c["close_on_launch"] = bool(self.close_var.get())
+            c["minimize_to_tray"] = bool(self.tray_var.get())
+            c["auto_update_mods"] = bool(self.autoupd_var.get())
         if hasattr(self, "discord_entry"):
             c["discord_app_id"] = self.discord_entry.get().strip()
         save_config(c)
 
     def on_close(self):
+        # крестик: если включён трей — прячем окно, иконка в трее остаётся
+        if self.cfg.get("minimize_to_tray") and not self._quitting and self._make_tray():
+            self.withdraw()
+            return
+        self._really_close()
+
+    def _really_close(self):
+        self._quitting = True
+        try:
+            if self._tray is not None:
+                self._tray.stop()
+        except Exception:
+            pass
+        self._tray = None
         try:
             self.save_all()
         finally:
             self.icon_pool.shutdown(wait=False, cancel_futures=True)
             self.destroy()
 
+    # ---------- трей ----------
+    def _make_tray(self):
+        """Создаёт иконку в трее. True — трей работает."""
+        if self._tray is not None:
+            return True
+        try:
+            import pystray
+            menu = pystray.Menu(
+                pystray.MenuItem("Открыть", self._tray_open, default=True),
+                pystray.MenuItem("Выход", self._tray_quit),
+            )
+            self._tray = pystray.Icon(LAUNCHER_NAME, visuals.logo(64, ACCENT, ACCENT2),
+                                      LAUNCHER_NAME, menu)
+            threading.Thread(target=self._tray.run, daemon=True).start()
+            return True
+        except Exception:
+            self._tray = None
+            return False
+
+    def _tray_open(self, icon=None, item=None):
+        self.after(0, lambda: (self.deiconify(), self.lift(), self.focus_force()))
+
+    def _tray_quit(self, icon=None, item=None):
+        self.after(0, self._really_close)
+
     # ---------- обновления лаунчера ----------
     def _check_update(self):
-        """Читает версию с сайта (data.js). Нет сети или сайта — молча пропускаем."""
+        """Читает сайт (data.js): версия для проверки обновлений + «Что нового»."""
         try:
             text = get_bytes(SITE_URL.rstrip("/") + "/data.js", timeout=8).decode("utf-8", "replace")
             m = re.search(r'version:\s*"([\d.]+)"', text)
             if m:
                 self.q.put(("update", m.group(1)))
+            try:
+                site = parse_site_data(text)
+                self.q.put(("whatsnew", site.get("changelog", [])))
+                self.q.put(("site_promos", site.get("promos", {})))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1958,7 +2266,7 @@ class App(ctk.CTk):
     # ---------- список версий ----------
     def _load_versions(self):
         try:
-            self.q.put(("versions", get_all_versions()))
+            self.q.put(("versions", get_all_versions_cached()))
         except Exception:
             self.q.put(("versions", None))
 
@@ -2065,6 +2373,10 @@ class App(ctk.CTk):
             q.put(("log_clear",))
             q.put(("running",))
             rpc.start_game(cfg.get("discord_app_id", ""), version, loader)
+            q.put(("launch_minimize",))
+            if cfg.get("auto_update_mods"):
+                threading.Thread(target=self._auto_mod_check, args=(dict(cfg),),
+                                 daemon=True).start()
             started = time.time()
             for line in proc.stdout:
                 tail.append(line)
@@ -2090,6 +2402,7 @@ class App(ctk.CTk):
     # ---------- сборки ----------
     def add_build(self, build):
         self.cfg["builds"].append(build)
+        cos.bump_counter(self.cfg, "builds")
         self.select_build(build["id"])
 
     def select_build(self, bid):
@@ -2222,6 +2535,7 @@ class App(ctk.CTk):
             self._set_busy(True, "Игра запущена")
             self._set_status("Игра запущена. Приятной игры!", ACCENT)
             self.cfg["stats"]["launches"] = self.cfg["stats"].get("launches", 0) + 1
+            cos.bump_counter(self.cfg, "launches")
             save_config(self.cfg)
         elif kind == "finished":
             self.progress.set(0)
@@ -2232,7 +2546,20 @@ class App(ctk.CTk):
             for bucket, name in (("by_version", msg[1]), ("by_account", msg[2])):
                 st.setdefault(bucket, {})
                 st[bucket][name] = st[bucket].get(name, 0) + msg[3]
+            secs = int(msg[3])
+            lines = []
+            cos.add_playtime(self.cfg, secs)
+            earned = cos.playtime_reward(secs)
+            if earned:
+                cos.add_crystals(self.cfg, earned)
+                lines.append(f"+{earned} 💎 за игру")
+            for d in cos.hourly_rolls(self.cfg, secs):
+                if d[0] == "crystals":
+                    lines.append(f"+{d[1]} 💎 часовой дроп")
             save_config(self.cfg)
+            if lines:
+                self.status.configure(text="  ·  ".join(lines), text_color=ACCENT)
+            self._refresh_lobby()
         elif kind == "update":
             self.available_version = msg[1]
             parse = lambda v: tuple(int(x) for x in v.split("."))
@@ -2276,8 +2603,42 @@ class App(ctk.CTk):
                     break
             save_config(self.cfg)
             self._update_profile()
+        elif kind == "site_promos":
+            self.site_promos = msg[1] or {}
         elif kind == "close_app":
             self.on_close()
+        elif kind == "launch_minimize":
+            if self.cfg.get("close_on_launch"):
+                self._really_close()
+            else:
+                self.iconify()
+        elif kind == "whatsnew":
+            if self.cfg.get("whatsnew_seen") != LAUNCHER_VERSION:
+                self.cfg["whatsnew_seen"] = LAUNCHER_VERSION
+                save_config(self.cfg)
+                log = msg[1]
+                entry = next((e for e in log if str(e.get("v")) == LAUNCHER_VERSION),
+                             log[0] if log else None)
+                if entry and entry.get("items"):
+                    try:
+                        WhatsNewDialog(self, entry)
+                    except Exception:
+                        pass
+        elif kind == "worlds_done":
+            if self._copy_dlg is not None:
+                try:
+                    self._copy_dlg.destroy()
+                except Exception:
+                    pass
+                self._copy_dlg = None
+            if msg[1]:
+                self._set_status(msg[1])
+                self.pages["worlds"].render()
+            else:
+                self._set_status(msg[2], ERROR)
+        elif kind == "progress_reset":
+            self.progress.set(0)
+            self._set_status("")
         elif kind == "export_done":
             self.pages["builds"].finished(msg[1], msg[2])
         elif kind == "log_clear":
@@ -2301,7 +2662,7 @@ class App(ctk.CTk):
                 self.mod_loading = False
                 self._render_mods()
         elif kind == "mods_hits":
-            if msg[2] == self._mods_key():
+            if msg[2] == self._search_key():
                 self.mod_hits, self.mod_hits_key = msg[1], msg[2]
             self.mod_loading = False
             self._set_mod_status("")

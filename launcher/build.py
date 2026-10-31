@@ -18,9 +18,14 @@ DIST = ROOT / "dist" / "YroveeLauncher"
 OUT = ROOT / "dist_out"
 
 INNO_PATHS = [
+    Path(r"C:\Program Files (x86)\Inno Setup 7\ISCC.exe"),
+    Path(r"C:\Program Files\Inno Setup 7\ISCC.exe"),
     Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
     Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
 ]
+if os.environ.get("LOCALAPPDATA"):  # установка «только для меня»
+    INNO_PATHS.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Inno Setup 7" / "ISCC.exe")
+    INNO_PATHS.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Inno Setup 6" / "ISCC.exe")
 
 
 def run(cmd, **kw):
@@ -51,7 +56,8 @@ def main():
     shutil.rmtree(ROOT / "build", ignore_errors=True)
     run([VPY, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
          "--name", "YroveeLauncher", "--icon", "assets/icon.ico",
-         "--collect-data", "customtkinter", "--hidden-import", "pypresence",
+         "--collect-data", "customtkinter", "--collect-submodules", "pystray",
+         "--hidden-import", "pypresence",
          "main.py"])
 
     print("[5/6] Упаковываю zip...", flush=True)

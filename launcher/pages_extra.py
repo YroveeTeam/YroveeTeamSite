@@ -496,6 +496,177 @@ class LogPage(BasePage):
 
 
 # ======================================================================
+#  Миры: сохранения из всех версий и сборок
+# ======================================================================
+class WorldsPage(BasePage):
+    LIMIT = 60
+    BAD_CHARS = '\\/:*?"<>|'
+
+    def __init__(self, app):
+        super().__init__(app, "Миры", "Сохранения из всех версий и сборок: копируй между версиями")
+        self.grid_rowconfigure(3, weight=1)
+        self._imgs = {}
+        self._copy_dlg = None
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        ctk.CTkButton(bar, text="Обновить", width=96, height=38, corner_radius=12, border_width=1,
+                      fg_color=G.FIELD, hover_color=G.HOVER, border_color=G.BORDER, text_color=G.TEXT,
+                      font=G.font(13), command=self.render).pack(side="left")
+        self.list = self.scroll(3)
+        self.list.grid_columnconfigure(0, weight=1)
+
+    def on_show(self):
+        self.render()
+
+    def _scan(self):
+        found = []
+        if INSTANCES_DIR.exists():
+            for inst in INSTANCES_DIR.iterdir():
+                saves = inst / "saves"
+                if saves.is_dir():
+                    for w in saves.iterdir():
+                        if w.is_dir() and (w / "level.dat").exists():
+                            found.append((w.stat().st_mtime, w, inst.name))
+        found.sort(reverse=True)
+        return found[: self.LIMIT]
+
+    def render(self):
+        app = self.app
+        for w in self.list.winfo_children():
+            w.destroy()
+        self._imgs = {}
+        worlds = self._scan()
+        if not worlds:
+            return self.hint(self.list, "Миров пока нет",
+                             "Создай мир в игре — он появится здесь, и его можно будет скопировать на другую версию")
+        from datetime import datetime
+        for mtime, w, inst in worlds:
+            row = ctk.CTkFrame(self.list, fg_color=G.CARD, corner_radius=16, border_width=1,
+                               border_color=G.BORDER)
+            row.pack(fill="x", padx=(0, 8), pady=5)
+            row.grid_columnconfigure(1, weight=1)
+            icon_lbl = ctk.CTkLabel(row, text="", width=48, height=48)
+            icon_lbl.grid(row=0, column=0, rowspan=2, padx=(14, 14), pady=12)
+            icon = w / "icon.png"
+            if icon.exists():
+                try:
+                    img = G.ctkimg(visuals.process_icon(icon.read_bytes(), 48), (48, 48))
+                    self._imgs[str(w)] = img
+                    icon_lbl.configure(image=img)
+                except Exception:
+                    pass
+            if not icon_lbl.cget("image"):
+                icon_lbl.configure(image=app._placeholder(w.name, None))
+            when = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M")
+            ctk.CTkLabel(row, text=w.name, font=G.font(15, "bold"), text_color=G.TEXT,
+                         anchor="w").grid(row=0, column=1, sticky="sw")
+            ctk.CTkLabel(row, text=f"{inst} · играли {when}", font=G.font(12),
+                         text_color=G.MUTED, anchor="w").grid(row=1, column=1, sticky="nw")
+            btns = ctk.CTkFrame(row, fg_color="transparent")
+            btns.grid(row=0, column=2, rowspan=2, padx=(10, 14), pady=8)
+            ctk.CTkButton(btns, text="Копировать →", width=110, height=32, corner_radius=10,
+                          fg_color=G.ACCENT, hover_color=G.ACCENT_HOVER, text_color=G.ACCENT_TEXT,
+                          font=G.font(12, "bold"), command=lambda w=w: self.copy_dialog(w)
+                          ).pack(side="left", padx=(0, 6))
+            ctk.CTkButton(btns, text="✎", width=40, height=32, corner_radius=10, border_width=1,
+                          fg_color="transparent", hover_color=G.HOVER, border_color=G.BORDER,
+                          text_color=G.TEXT, font=G.font(13),
+                          command=lambda w=w: self.rename_world(w)).pack(side="left", padx=(0, 6))
+            del_btn = ctk.CTkButton(btns, text="🗑", width=40, height=32, corner_radius=10,
+                                    border_width=1, fg_color="transparent", hover_color=G.HOVER,
+                                    border_color=G.ERROR, text_color=G.ERROR, font=G.font(13))
+            del_btn.configure(command=lambda w=w, b=del_btn: self.delete_world(w, b))
+            del_btn.pack(side="left")
+
+    # --- действия ---
+    def _status(self, text, error=False):
+        self.app.q.put(("status", text, error))
+
+    def copy_dialog(self, world):
+        src_inst = world.parent.parent.name
+        insts = sorted((p.name for p in INSTANCES_DIR.iterdir() if p.is_dir()),
+                       reverse=True) if INSTANCES_DIR.exists() else []
+        insts = [i for i in insts if i != src_inst]
+        if not insts:
+            return self._status("Других версий и сборок нет — копировать некуда", True)
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Копировать мир")
+        dlg.geometry("430x230")
+        dlg.resizable(False, False)
+        dlg.configure(fg_color=G.BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(dlg, text=f"Мир «{world.name}»", font=G.font(17, "bold"),
+                     text_color=G.TEXT).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 4))
+        ctk.CTkLabel(dlg, text="Куда скопировать?", font=G.font(13), text_color=G.MUTED,
+                     anchor="w").grid(row=1, column=0, sticky="w", padx=22)
+        menu = ctk.CTkOptionMenu(dlg, values=insts, height=40, corner_radius=12,
+                                 fg_color=G.FIELD, button_color=G.BORDER,
+                                 button_hover_color=G.HOVER, text_color=G.TEXT,
+                                 font=G.font(13))
+        menu.set(insts[0])
+        menu.grid(row=2, column=0, sticky="ew", padx=22, pady=(6, 14))
+        self._copy_btn = ctk.CTkButton(dlg, text="Скопировать", height=42, corner_radius=12,
+                                       fg_color=G.ACCENT, hover_color=G.ACCENT_HOVER,
+                                       text_color=G.ACCENT_TEXT, font=G.font(13, "bold"),
+                                       command=lambda: self._do_copy(world, menu.get(), dlg))
+        self._copy_btn.grid(row=3, column=0, sticky="ew", padx=22, pady=(0, 22))
+        self._copy_dlg = dlg
+
+    def _do_copy(self, world, target_inst, dlg):
+        self._copy_btn.configure(state="disabled", text="Копирую…")
+
+        def run():
+            try:
+                dst_root = INSTANCES_DIR / target_inst / "saves"
+                dst_root.mkdir(parents=True, exist_ok=True)
+                dst, n = dst_root / world.name, 2
+                while dst.exists():
+                    dst = dst_root / f"{world.name} ({n})"
+                    n += 1
+                shutil.copytree(world, dst)
+                self.app.q.put(("worlds_done", f"Мир скопирован в «{target_inst}» как «{dst.name}»"))
+            except Exception as e:
+                self.app.q.put(("worlds_done", None, f"Не удалось скопировать: {e}"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def rename_world(self, world):
+        dlg = ctk.CTkInputDialog(text="Новое название мира:", title="Переименовать мир")
+        name = (dlg.get_input() or "").strip()
+        name = "".join(c for c in name if c not in self.BAD_CHARS)
+        if not name or name == world.name:
+            return
+        try:
+            world.rename(world.parent / name)
+            self._status("Мир переименован")
+            self.render()
+        except Exception as e:
+            self._status(f"Не удалось переименовать: {e}", True)
+
+    def delete_world(self, world, btn):
+        if getattr(btn, "_armed", False):
+            try:
+                shutil.rmtree(world)
+                self._status(f"Мир «{world.name}» удалён")
+                self.render()
+            except Exception as e:
+                self._status(f"Не удалось удалить: {e}", True)
+            return
+        btn._armed = True
+        btn.configure(text="Точно?")
+        self.after(3500, lambda: self._disarm(btn))
+
+    def _disarm(self, btn):
+        try:
+            if btn.winfo_exists():
+                btn._armed = False
+                btn.configure(text="🗑")
+        except Exception:
+            pass
+
+
+# ======================================================================
 #  Статистика
 # ======================================================================
 class StatsPage(BasePage):

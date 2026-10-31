@@ -5,7 +5,7 @@ import re
 import sys
 import zipfile
 
-from config import VERSIONS_DIR, LIBRARIES_DIR, ASSETS_DIR, NATIVES_DIR
+from config import VERSIONS_DIR, LIBRARIES_DIR, ASSETS_DIR, NATIVES_DIR, CACHE_DIR
 from net import get_json, download_file, download_many
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -226,7 +226,28 @@ def install_version(version_id, progress=None):
 def get_all_versions():
     """[(id, type), ...] из манифеста Mojang, новые версии первыми."""
     manifest = get_json(MANIFEST_URL)
-    return [(v["id"], v["type"]) for v in manifest["versions"]]
+    result = [(v["id"], v["type"]) for v in manifest["versions"]]
+    try:  # кэш на случай, когда в следующий раз не будет сети
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (CACHE_DIR / "versions_cache.json").write_text(
+            json.dumps(result), encoding="utf-8")
+    except Exception:
+        pass
+    return result
+
+
+def get_all_versions_cached():
+    """Онлайн-список версий; при неудаче — кэш последнего удачного списка."""
+    try:
+        return get_all_versions()
+    except Exception:
+        p = CACHE_DIR / "versions_cache.json"
+        if p.exists():
+            try:
+                return [tuple(x) for x in json.loads(p.read_text(encoding="utf-8"))]
+            except Exception:
+                pass
+        raise
 
 
 def installed_versions():

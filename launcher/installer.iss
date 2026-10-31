@@ -1,7 +1,7 @@
 ; Скрипт установщика для Inno Setup (бесплатно: jrsoftware.org). Запускать после build_exe.bat
 [Setup]
 AppName=YroveeLauncher
-AppVersion=0.9
+AppVersion=0.10
 DefaultDirName={autopf}\YroveeLauncher
 DefaultGroupName=YroveeLauncher
 PrivilegesRequired=lowest
